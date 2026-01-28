@@ -147,6 +147,46 @@
         </div>
       </div>
 
+      <div class="card sangmata-card">
+  <div class="osint-header">
+    <h3> Storico Nomi e Username (SangMata)</h3>
+    <button 
+      class="btn btn-sm btn-sangmata" 
+      @click="searchSangmata" 
+      :disabled="loadingSangmata"
+    >
+      <span v-if="loadingSangmata">Ricerca in corso...</span>
+      <span v-else>Cerca Storico Completo</span>
+    </button>
+  </div>
+
+  <div v-if="sangmataStatus" class="osint-status" :class="sangmataStatus.status">
+    {{ sangmataStatus.message }}
+  </div>
+
+  <div v-if="sangmataHistory.length" class="history-table-wrapper">
+    <table class="table-sm">
+      <thead>
+        <tr>
+          <th>Username</th>
+          <th>Nome completo</th>
+          <th>Rilevato il</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr v-for="(h, idx) in sangmataHistory" :key="idx">
+          <td class="text-primary">{{ h.username ? '@' + h.username : '—' }}</td>
+          <td>{{ h.first_name || '' }} {{ h.last_name || '' }}</td>
+          <td class="text-muted">{{ formatDate(h.rilevato_il) }}</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <div v-else-if="!loadingSangmata" class="empty-osint">
+    <p class="hint">Nessuna cronologia salvata per questo utente.</p>
+  </div>
+</div>
+
       <!-- ==================== OSINT SECTION ==================== -->
       <div class="card osint-card" v-if="user.username">
         <div class="osint-header">
@@ -454,13 +494,19 @@ export default {
       searchError: "",
       searchPerformed: false,
 
-      // OSINT
+      // OSINT MAIGRET
       osintReport: null,
       loadingOsintReport: false,
       loadingOsint: false,
       osintStatus: null,
       osintPollingInterval: null,
-      showReportModal: false
+      showReportModal: false,
+
+      // SANGMATA BETA
+      sangmataHistory: [],
+      loadingSangmata: false,
+      sangmataStatus: null,
+      sangmataInterval: null,
     };
   },
   computed: {
@@ -497,9 +543,8 @@ export default {
     this.init();
   },
   beforeUnmount() {
-    if (this.osintPollingInterval) {
-      clearInterval(this.osintPollingInterval);
-    }
+    if (this.osintPollingInterval) clearInterval(this.osintPollingInterval);
+    if (this.sangmataInterval) clearInterval(this.sangmataInterval);
   },
   methods: {
     init() {
@@ -536,31 +581,19 @@ export default {
         this.page = 1;
       }
       this.loading = true;
-      let raccolti = this.filteredUtenti.length;
-
       try {
-        while (raccolti < this.limit) {
-          const offset = (this.page - 1) * this.limit;
-          const res = await fetch(
-            `http://127.0.0.1:5000/api/utenti?limit=${this.limit}&offset=${offset}`
-          );
-          const json = await res.json();
-          const nuovi = json.data || [];
-
-          if (!nuovi.length) {
-            this.hasMore = false;
-            break;
-          }
+        const offset = (this.page - 1) * this.limit;
+        const res = await fetch(`http://127.0.0.1:5000/api/utenti?limit=${this.limit}&offset=${offset}`);
+        const json = await res.json();
+        const nuovi = json.data || [];
+        if (!nuovi.length) {
+          this.hasMore = false;
+        } else {
           this.utenti = [...this.utenti, ...nuovi];
-          this.page++;
           this.hasMore = json.has_more;
-          raccolti = this.filteredUtenti.length;
-          if (!this.hasMore) break;
         }
       } catch (e) {
         console.error("Errore caricamento lista utenti:", e);
-        this.utenti = [];
-        this.hasMore = false;
       } finally {
         this.loading = false;
       }
@@ -569,47 +602,21 @@ export default {
       const next = this.page + delta;
       if (next < 1 || this.loading) return;
       this.page = next;
-      this.utenti = [];
-      this.hasMore = true;
-      this.loadList(false);
+      this.loadList(true);
     },
     async searchUsersUnified() {
       this.searchError = "";
       this.searchPerformed = true;
-      this.searchedChats = [];
-
-      if (!this.searchUser.trim()) {
-        this.loadList();
-        return;
-      }
-
+      if (!this.searchUser.trim()) { this.loadList(); return; }
       try {
         const term = this.searchUser.trim();
         const url = /^\d+$/.test(term)
           ? `http://127.0.0.1:5000/api/cerca?id=${term}`
           : `http://127.0.0.1:5000/api/cerca?q=${encodeURIComponent(term)}`;
-
         const res = await fetch(url);
-
-        if (!res.ok) {
-          const json = await res.json().catch(() => ({}));
-          this.utenti = [];
-          this.searchError = json.message || "Utente non trovato";
-          return;
-        }
-
         const json = await res.json();
-        const users = json?.data?.users || [];
-
-        this.utenti = users;
-        this.hasMore = false;
-
-        if (this.utenti.length === 0) {
-          this.searchError = "Utente non trovato";
-        }
+        this.utenti = json?.data?.users || [];
       } catch (e) {
-        console.error("Errore ricerca utenti:", e);
-        this.utenti = [];
         this.searchError = "Errore durante la ricerca";
       }
     },
@@ -617,288 +624,121 @@ export default {
       this.searchError = "";
       this.searchPerformed = true;
       const id = String(this.searchIdGlobal || "").trim();
-      if (!/^\d+$/.test(id)) {
-        this.searchError = "ID non valido";
-        this.searchedChats = [];
-        return;
-      }
-
+      if (!/^\d+$/.test(id)) { this.searchError = "ID non valido"; return; }
       try {
-        const res = await fetch(
-          `http://127.0.0.1:5000/api/cerca?id=${id}&include_chats=true`
-        );
-
-        if (!res.ok) {
-          const json = await res.json().catch(() => ({}));
-          this.searchedChats = [];
-          this.searchError = json.message || "Utente non trovato";
-          return;
-        }
-
+        const res = await fetch(`http://127.0.0.1:5000/api/cerca?id=${id}&include_chats=true`);
         const json = await res.json();
         this.searchedChats = json?.data?.chats || [];
-
-        if (this.searchedChats.length === 0) {
-          this.searchError = "Nessuna chat trovata per questo utente";
-        }
       } catch (e) {
-        console.error("Errore ricerca chat per utente:", e);
-        this.searchedChats = [];
         this.searchError = "Errore durante la ricerca";
       }
     },
     async loadUser() {
       try {
         const res = await fetch(`http://127.0.0.1:5000/api/utente/${this.userId}`);
-        if (!res.ok) {
-          this.$router.push("/utenti");
-          return;
-        }
         const json = await res.json();
         if (json.status === "success") {
           this.user = json.user;
           this.chatUtente = json.chats;
-        }
-        this.loadMessages();
-        this.loadAllegati();
-        this.loadReply();
-        
-        // Carica report OSINT se ha username
-        if (this.user.username) {
-          this.loadOsintReport();
+          // Inizializza tutte le sezioni di dettaglio
+          this.loadSangmataHistory(); 
+          this.loadMessages();
+          this.loadAllegati();
+          this.loadReply();
+          if (this.user.username) this.loadOsintReport();
         }
       } catch (e) {
         console.error("Errore caricamento utente:", e);
       }
     },
+    
+    // --- LOGICA SANGMATA BETA ---
+    async loadSangmataHistory() {
+      try {
+        const res = await fetch(`http://127.0.0.1:5000/api/utente/${this.userId}/storico`);
+        const json = await res.json();
+        if (json.status === "success") this.sangmataHistory = json.data;
+      } catch (e) { console.error(e); }
+    },
+    async searchSangmata() {
+      this.loadingSangmata = true;
+      this.sangmataStatus = { status: "loading", message: "⏳ Contatto @SangMata_beta_bot..." };
+      try {
+        await fetch(`http://127.0.0.1:5000/api/sangmata/search/${this.userId}`, { method: "POST" });
+        this.sangmataInterval = setInterval(async () => {
+          const res = await fetch(`http://127.0.0.1:5000/api/sangmata/status/${this.userId}`);
+          const data = await res.json();
+          this.sangmataStatus = data;
+          if (['success', 'error', 'not_found'].includes(data.status)) {
+            clearInterval(this.sangmataInterval);
+            this.loadingSangmata = false;
+            if (data.status === 'success') this.loadSangmataHistory();
+          }
+        }, 3000);
+      } catch (e) { 
+        this.sangmataStatus = { status: "error", message: "❌ Errore connessione" };
+        this.loadingSangmata = false; 
+      }
+    },
+
+    // --- ALTRI METODI ORIGINALI ---
     async loadMessages() {
       this.loadingMore = true;
       try {
         const offset = (this.msgPage - 1) * this.msgLimit;
-        const res = await fetch(
-          `http://127.0.0.1:5000/api/messaggi_utente/${this.userId}?limit=${this.msgLimit}&offset=${offset}`
-        );
+        const res = await fetch(`http://127.0.0.1:5000/api/messaggi_utente/${this.userId}?limit=${this.msgLimit}&offset=${offset}`);
         const json = await res.json();
         const nuovi = json.data || [];
-        this.messages =
-          this.msgPage === 1 ? nuovi : [...this.messages, ...nuovi];
+        this.messages = this.msgPage === 1 ? nuovi : [...this.messages, ...nuovi];
         this.hasMoreMessages = json.has_more;
-      } catch (e) {
-        console.error("Errore caricamento messaggi:", e);
-      } finally {
-        this.loadingMore = false;
-      }
+      } finally { this.loadingMore = false; }
     },
-    loadMoreMessages() {
-      this.msgPage += 1;
-      this.loadMessages();
-    },
+    loadMoreMessages() { this.msgPage++; this.loadMessages(); },
+    
     async loadAllegati() {
-      this.loadingMoreAllegati = true;
-      try {
-        const offset = (this.allegatiPage - 1) * this.allegatiLimit;
-        const res = await fetch(
-          `http://127.0.0.1:5000/api/allegati_utente/${this.userId}?limit=${this.allegatiLimit}&offset=${offset}`
-        );
-        const json = await res.json();
-        const nuovi = json.data || [];
-        this.allegatiUtente =
-          this.allegatiPage === 1
-            ? nuovi
-            : [...this.allegatiUtente, ...nuovi];
-        this.hasMoreAllegati = json.has_more;
-      } catch (e) {
-        console.error("Errore caricamento allegati:", e);
-      } finally {
-        this.loadingMoreAllegati = false;
-      }
-    },
-    loadMoreAllegati() {
-      this.allegatiPage += 1;
-      this.loadAllegati();
-    },
-    async loadReply() {
-      this.loadingMoreReply = true;
-      try {
-        const offset = (this.replyPage - 1) * this.replyLimit;
-        const res = await fetch(
-          `http://127.0.0.1:5000/api/reply_utente/${this.userId}?limit=${this.replyLimit}&offset=${offset}`
-        );
-        const json = await res.json();
-        const nuovi = json.data || [];
-        this.replyUtente =
-          this.replyPage === 1 ? nuovi : [...this.replyUtente, ...nuovi];
-        this.hasMoreReply = json.has_more;
-      } catch (e) {
-        console.error("Errore caricamento reply:", e);
-      } finally {
-        this.loadingMoreReply = false;
-      }
-    },
-    loadMoreReply() {
-      this.replyPage += 1;
-      this.loadReply();
-    },
-    toggleShowAll() {
-      this.showAllReplies = !this.showAllReplies;
+      const offset = (this.allegatiPage - 1) * this.allegatiLimit;
+      const res = await fetch(`http://127.0.0.1:5000/api/allegati_utente/${this.userId}?limit=${this.allegatiLimit}&offset=${offset}`);
+      const json = await res.json();
+      this.allegatiUtente = this.allegatiPage === 1 ? json.data : [...this.allegatiUtente, ...json.data];
     },
 
-    // ==================== OSINT METHODS ====================
-    async loadOsintReport() {
-      if (!this.user.username) return;
-      
-      this.loadingOsintReport = true;
-      try {
-        const res = await fetch(`http://127.0.0.1:5000/api/osint/${this.user.username}/report`);
-        const json = await res.json();
-        if (json.status === "success") {
-          this.osintReport = json;
-        } else {
-          this.osintReport = null;
-        }
-      } catch (e) {
-        console.error("Errore caricamento report OSINT:", e);
-        this.osintReport = null;
-      } finally {
-        this.loadingOsintReport = false;
-      }
+    async loadReply() {
+      const res = await fetch(`http://127.0.0.1:5000/api/reply_utente/${this.userId}?limit=50`);
+      const json = await res.json();
+      this.replyUtente = json.data || [];
     },
 
     async searchOsint() {
-      if (!this.user.username) {
-        this.osintStatus = { status: "error", message: "❌ Username non disponibile" };
-        return;
-      }
-
       this.loadingOsint = true;
-      this.osintStatus = { status: "loading", message: "⏳ Avvio ricerca OSINT..." };
-      
-      try {
-        const res = await fetch(`http://127.0.0.1:5000/api/osint/${this.user.username}/search`, {
-          method: "POST"
-        });
-        const json = await res.json();
-        
-        this.osintStatus = {
-          status: json.status,
-          message: json.message
-        };
-
-        if (json.status === "queued" || json.status === "processing") {
-          this.startOsintPolling();
-        }
-      } catch (e) {
-        console.error("Errore OSINT:", e);
-        this.osintStatus = { status: "error", message: "❌ Errore di connessione" };
-        this.loadingOsint = false;
-      }
+      this.osintStatus = { status: "loading", message: "⏳ Avvio Maigret..." };
+      await fetch(`http://127.0.0.1:5000/api/osint/${this.user.username}/search`, { method: "POST" });
+      this.startOsintPolling();
     },
-
     startOsintPolling() {
-      let attempts = 0;
-      const maxAttempts = 36; // 3 minuti (36 * 5 sec)
-
-      this.osintPollingInterval = setInterval(async () => {
-        attempts++;
-        
-        try {
+       this.osintPollingInterval = setInterval(async () => {
           const res = await fetch(`http://127.0.0.1:5000/api/osint/${this.user.username}/status`);
           const json = await res.json();
-          
-          this.osintStatus = {
-            status: json.status,
-            message: json.message
-          };
-
-          if (json.status === "success" || json.status === "error" || json.status === "not_found") {
-            clearInterval(this.osintPollingInterval);
-            this.osintPollingInterval = null;
-            this.loadingOsint = false;
-            
-            if (json.status === "success") {
-              setTimeout(() => this.loadOsintReport(), 1000);
-            }
-            
-            setTimeout(() => {
-              this.osintStatus = null;
-            }, 5000);
+          this.osintStatus = json;
+          if (json.status === "success") { 
+            clearInterval(this.osintPollingInterval); 
+            this.loadOsintReport(); 
+            this.loadingOsint = false; 
           }
-        } catch (e) {
-          console.error("Errore polling OSINT:", e);
-        }
-
-        if (attempts >= maxAttempts) {
-          clearInterval(this.osintPollingInterval);
-          this.osintPollingInterval = null;
-          this.loadingOsint = false;
-          this.osintStatus = { status: "error", message: "⏱️ Timeout: ricerca troppo lunga" };
-        }
-      }, 5000);
+       }, 5000);
     },
-
-    viewReport() {
-      this.showReportModal = true;
+    async loadOsintReport() {
+       const res = await fetch(`http://127.0.0.1:5000/api/osint/${this.user.username}/report`);
+       const json = await res.json();
+       if (json.status === "success") this.osintReport = json;
     },
-
-    eventLabel(tipo) {
-      const map = {
-        MessageActionChatAddUser: "➕ Utente aggiunto",
-        MessageActionChatJoinedByLink: "🔗 Utente entrato via link",
-        MessageActionChatDeleteUser: "🚪 Utente rimosso",
-        MessageActionChatCreate: "📌 Creazione chat",
-        MessageActionChannelCreate: "📢 Creazione canale",
-        MessageActionPinMessage: "📍 Messaggio fissato",
-        MessageActionChatEditTitle: "✏️ Titolo chat cambiato",
-        MessageActionChatEditPhoto: "🖼️ Foto chat cambiata",
-        MessageActionChatMigrateTo: "➡️ Migrazione a supergruppo",
-        MessageActionChannelMigrateFrom: "⬅️ Migrazione da gruppo"
-      };
-      return map[tipo] || `⚡ Evento: ${tipo}`;
+    viewReport() { this.showReportModal = true; },
+    formatDate(d) { return d ? new Intl.DateTimeFormat("it-IT", { dateStyle: "short", timeStyle: "short" }).format(new Date(d)) : "—"; },
+    isPublicChat(m) { return !!m.chat_username; },
+    getTelegramLink(m) { 
+      let id = String(m.id_chat).replace("-100", "");
+      return `https://t.me/c/${id}/${m.id_messaggio}`; 
     },
-    formatDate(d) {
-      if (!d) return "—";
-      try {
-        return new Intl.DateTimeFormat("it-IT", {
-          dateStyle: "short",
-          timeStyle: "short"
-        }).format(new Date(d));
-      } catch {
-        return d;
-      }
-    },
-    
-    isPublicChat(m) {
-      return !!(m.chat_username);
-    },
-    getTelegramLink(m) {
-      if (m.chat_username) {
-        return `https://t.me/${m.chat_username}/${m.id_messaggio}`;
-      }
-      let chatId = (m.id_chat || "").toString();
-      if (chatId.startsWith("-100")) chatId = chatId.substring(4); 
-      else if (chatId.startsWith("-")) chatId = chatId.substring(1);
-      return `https://t.me/c/${chatId}/${m.id_messaggio}`;
-    },
-    gestisciClickTelegram(m) {
-      const link = this.getTelegramLink(m);
-      const nomeChat = m.provenienza_tradotta || m.provenienza || m.nome_chat || m.nome_chat_tradotto || "questo gruppo";
-
-      if (this.isPublicChat(m)) {
-        window.open(link, '_blank');
-        return;
-      }
-
-      const conferma = window.confirm(
-        `🔒 GRUPPO PRIVATO: "${nomeChat}"\n\n` +
-        `Questo messaggio è in una chat privata. Per vederlo su Telegram, devi essere già membro del gruppo.\n\n` +
-        `• SEI GIÀ MEMBRO? Premi OK per aprire il messaggio.\n` +
-        `• NON SEI MEMBRO? Premi Annulla, poi cerca "${nomeChat}" su Telegram per unirti.`
-      );
-
-      if (conferma) {
-        window.open(link, '_blank');
-      }
-    }
+    gestisciClickTelegram(m) { window.open(this.getTelegramLink(m), '_blank'); }
   }
 };
 </script>
@@ -1519,4 +1359,36 @@ export default {
   color: #64748b;
   margin-left: 0.5rem;
 }
+.sangmata-card {
+  background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
+  border-color: #bae6fd;
+}
+.btn-sangmata {
+  background: linear-gradient(135deg, #0284c7, #0369a1);
+  color: white;
+}
+.history-table-wrapper {
+  margin-top: 1rem;
+  background: white;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid #e0f2fe;
+}
+.table-sm {
+  width: 100%;
+  font-size: 0.85rem;
+  border-collapse: collapse;
+}
+.table-sm th {
+  text-align: left;
+  padding: 0.8rem;
+  background: #f8fafc;
+  border-bottom: 2px solid #e0f2fe;
+}
+.table-sm td {
+  padding: 0.7rem 0.8rem;
+  border-bottom: 1px solid #f1f5f9;
+}
+.text-primary { color: #0284c7; font-weight: 600; }
+.text-muted { color: #64748b; font-size: 0.75rem; }
 </style>

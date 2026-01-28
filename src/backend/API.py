@@ -13,6 +13,7 @@ from datetime import datetime
 from deep_translator import GoogleTranslator
 from Neo4jConnector2_0 import run_query
 from pathlib import Path
+from sangmata_service import queue_sangmata_request, get_request_status as get_sangmata_status
 
 def translate_if_needed(text: str) -> str:
     """Traduci il testo in italiano se non è vuoto."""
@@ -2331,6 +2332,51 @@ def get_osint_status(username):
         return jsonify({"status": "idle", "message": "Servizio non attivo"})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
+    
+# =========================
+# SangMata - Storico Username
+# =========================
+
+@app.route("/api/sangmata/search/<int:user_id>", methods=["POST"])
+def start_sangmata_search(user_id):
+    """Avvia la ricerca dello storico username in background"""
+    try:
+        queue_sangmata_request(user_id)
+        return jsonify({"status": "queued", "message": "⏳ Ricerca storico avviata..."})
+    except Exception as e:
+        logger.error(f"Errore avvio SangMata: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route("/api/sangmata/status/<int:user_id>", methods=["GET"])
+def check_sangmata_status(user_id):
+    """Controlla lo stato della ricerca SangMata"""
+    status = get_sangmata_status(user_id)
+    return jsonify(status)
+
+@app.route("/api/utente/<int:user_id>/storico", methods=["GET"])
+def get_utente_storico(user_id):
+    """Recupera i record dello storico salvati nel database"""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT username, first_name, last_name, rilevato_il, fonte 
+            FROM storico_username 
+            WHERE user_id = %s 
+            ORDER BY rilevato_il DESC
+        """, (user_id,))
+        rows = cursor.fetchall()
+        
+        for r in rows:
+            r["rilevato_il"] = to_iso_utc(r["rilevato_il"])
+            
+        return jsonify({"status": "success", "data": rows})
+    except Exception as e:
+        logger.error(f"Errore recupero storico DB: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
     
     
 # =========================
