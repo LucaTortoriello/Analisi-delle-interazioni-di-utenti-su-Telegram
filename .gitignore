@@ -1,0 +1,20 @@
+# --- Dipendenze e cartelle pesanti ---
+node_modules/
+venv/
+__pycache__/
+*.argosmodel
+
+# --- Credenziali---
+credenzialiDB.env
+*.session
+*.session-journal
+
+# --- Log e Report ---
+*.log
+osint_reports/
+downloads/
+
+# --- File di sistema e IDE ---
+.DS_Store
+.vscode/
+dist/

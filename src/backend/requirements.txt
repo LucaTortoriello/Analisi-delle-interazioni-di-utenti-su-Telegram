@@ -1,0 +1,18 @@
+# Librerie Flask per API
+flask
+flask-cors
+
+# Connessione a MySQL
+mysql-connector-python
+
+# Gestione variabili d'ambiente
+python-dotenv
+
+# Libreria per traduzione messaggi
+deep-translator
+
+# Telethon per import da Telegram (usato in ConnessioneDBAnalisiTelegram.py)
+telethon
+
+# Utility varie
+requests
