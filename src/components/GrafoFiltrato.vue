@@ -26,6 +26,12 @@
 
     <!-- Barra di ricerca per esplorare nodi -->
     <div class="search-bar">
+      <select v-model="selectedCategory" @change="reloadGraph" class="category-select">
+    <option value=""> Tutte le categorie</option>
+    <option v-for="cat in categories" :key="cat.categoria_chat" :value="cat.categoria_chat">
+      {{ cat.categoria_chat }} ({{ cat.totale }})
+    </option>
+  </select>
       <input
         v-model="focusQuery"
         class="search-input"
@@ -362,6 +368,9 @@ export default {
       nodeCache: {},
       currentLoadingId: null,
       clickTimer: null,
+
+      categories: [],
+      selectedCategory: "",
     };
   },
 
@@ -383,6 +392,22 @@ export default {
       return `⚖️ Bilancio equilibrato`;
     }
   },
+  
+  async fetchCategories() {
+    try {
+      const res = await fetch("http://127.0.0.1:5000/api/chat_per_categoria");
+      if (res.ok) {
+        const json = await res.json();
+        this.categories = json.data || [];
+      }
+    } catch (e) {
+      console.error("Errore caricamento categorie:", e);
+    }
+  },
+
+  reloadGraph() {
+    this.loadGraph();
+  },
 
   async mounted() {
     this.keyword = this.$route.query.term || "";
@@ -391,7 +416,8 @@ export default {
       this.$router.push("/");
       return;
     }
-    await this.loadGraph();
+    await this.loadGraph()
+    await this.fetchCategories();
   },
 
   beforeUnmount() {
@@ -514,39 +540,53 @@ export default {
 
     // ===== CARICA GRAFO =====
     async loadGraph() {
-      this.loading = true;
-      try {
-        const res = await fetch(
-          `http://127.0.0.1:5000/api/graph/keyword?term=${encodeURIComponent(this.keyword)}&maxUsers=50&minCount=1&maxTargets=30`
-        );
-        if (!res.ok) throw new Error(`Errore HTTP ${res.status}`);
-        const json = await res.json();
+  this.loading = true;
+  try {
+    // 1. Definiamo l'URL base per la ricerca per keyword
+    let url = `http://127.0.0.1:5000/api/graph/keyword?term=${encodeURIComponent(this.keyword)}&maxUsers=50&minCount=1&maxTargets=30`;
 
-        this.stats = {
-          nodes: json.nodes?.length || 0,
-          edges: json.keyword_edges?.length || 0,
-          keyword_edges: json.keyword_edges?.length || 0,
-        };
-        this.keywordStats = json.keyword_stats || {};
-        this.exploredNodesDepth = {};
+    // 2. Aggiungiamo il parametro category solo se è stato selezionato dall'utente
+    if (this.selectedCategory) {
+      url += `&category=${encodeURIComponent(this.selectedCategory)}`;
+    }
 
-        const nodes = (json.nodes || []).map((n) => ({
-          ...n,
-          color: n.hasKeyword
-            ? { background: "#facc15", border: "#d97706", highlight: { background: "#fde047", border: "#d97706" }, hover: { background: "#fde047", border: "#d97706" } }
-            : { background: "#2563eb", border: "#1e40af", highlight: { background: "#3b82f6", border: "#1e40af" }, hover: { background: "#3b82f6", border: "#1e40af" } },
-        }));
+    // 3. Eseguiamo la fetch all'URL dinamico
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Errore HTTP ${res.status}`);
+    
+    const json = await res.json();
 
-        this.nodesDS = new DataSet(nodes);
-        this.edgesDS = new DataSet(json.keyword_edges || []);
-        this.renderGraph();
-      } catch (error) {
-        console.error("Errore caricamento grafo:", error);
-        alert("Errore nel caricamento del grafo.");
-      } finally {
-        this.loading = false;
-      }
-    },
+    // Aggiornamento delle statistiche del grafo
+    this.stats = {
+      nodes: json.nodes?.length || 0,
+      edges: json.keyword_edges?.length || 0,
+      keyword_edges: json.keyword_edges?.length || 0,
+    };
+
+    this.keywordStats = json.keyword_stats || {};
+    this.exploredNodesDepth = {};
+
+    // Mappatura dei nodi con i colori relativi alla presenza della keyword
+    const nodes = (json.nodes || []).map((n) => ({
+      ...n,
+      color: n.hasKeyword
+        ? { background: "#facc15", border: "#d97706", highlight: { background: "#fde047", border: "#d97706" }, hover: { background: "#fde047", border: "#d97706" } }
+        : { background: "#2563eb", border: "#1e40af", highlight: { background: "#3b82f6", border: "#1e40af" }, hover: { background: "#3b82f6", border: "#1e40af" } },
+    }));
+
+    // Inizializzazione dei DataSet per la visualizzazione
+    this.nodesDS = new DataSet(nodes);
+    this.edgesDS = new DataSet(json.keyword_edges || []);
+    
+    this.renderGraph();
+  } catch (error) {
+    console.error("Errore caricamento grafo:", error);
+    alert("Errore nel caricamento del grafo.");
+  } finally {
+    this.loading = false;
+  }
+
+},
 
     renderGraph() {
       if (this.network) this.network.destroy();
@@ -1007,5 +1047,20 @@ export default {
 
 @media (max-width: 768px) {
   .edge-summary-visual { flex-direction: column; gap: 1rem; }
+}
+
+.category-select {
+  padding: 0.5rem 0.8rem;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  background: white;
+  font-size: 0.95rem;
+  max-width: 200px;
+  cursor: pointer;
+}
+
+.category-select:focus {
+  outline: none;
+  border-color: #3558ff;
 }
 </style>

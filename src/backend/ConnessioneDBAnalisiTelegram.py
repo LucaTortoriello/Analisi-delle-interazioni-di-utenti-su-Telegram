@@ -30,9 +30,9 @@ import mysql.connector
 from dotenv import load_dotenv
 from telethon.sync import TelegramClient
 from telethon.tl.types import (
-    Channel,  # <--- Import necessario per il fix
-    Chat,     # <--- Import necessario per il fix
-    User,     # <--- Import necessario per il fix
+    Channel,  
+    Chat,     
+    User,     
     MessageEntityMention,
     MessageEntityMentionName,
     MessageEntityUrl,
@@ -131,7 +131,7 @@ DB_NAME = os.getenv("DB_NAME", "analisiutentitelegram")
 BATCH_SIZE = env_int("BATCH_SIZE", 2000)
 MAX_MEDIA_CONCURRENCY = env_int("MAX_MEDIA_CONCURRENCY", 40)  # limite download paralleli
 PROGRESS_EVERY = env_int("PROGRESS_EVERY", 1000)
-SKIP_MEDIA = env_bool("SKIP_MEDIA", False)
+SKIP_MEDIA = env_bool("SKIP_MEDIA", True)
 
 # Limite massimo messaggi per chat (parametrizzabile via MAX_MSG)
 MAX_MSG = env_int("MAX_MSG", 30000)
@@ -350,7 +350,12 @@ async def get_admins_for_chat(client, entity):
 # =========================
 # È possibile modificare questo elenco a seconda dei gruppi/canali da monitorare.
 targets = [
-"terzipatida5mg"
+"zelenogradskij",
+"zelenograd_chat_moskva",
+"moskva_zelenograd_ish_kor_rabota",
+"moskva_zelenograd_ish_kor_rabota",
+"imkarinamorozovaa",
+"moskva_ish_xaltura_zelenograd"
 ]
 
 # =========================

@@ -12,6 +12,13 @@
     </div>
 
     <div class="search-bar">
+      <select v-model="selectedCategory" @change="reloadGraph" class="category-select">
+      <option value=""> Tutte le categorie</option>
+      <option v-for="cat in categories" :key="cat.categoria_chat" :value="cat.categoria_chat">
+        {{ cat.categoria_chat }} ({{ cat.totale }})
+      </option>
+      </select>
+
       <input
         v-model="query"
         class="search-input"
@@ -384,6 +391,8 @@ export default {
       expandedUsers: new Set(),
       userRepliesCache: {},
       loadingUserReplies: null,
+      categories: [],        
+      selectedCategory: "",
     };
   },
 
@@ -583,6 +592,21 @@ export default {
         };
       } catch (err) { console.error("Errore fetch reply summary:", err); this.nodeReplySummary = null; }
     },
+    async fetchCategories() {
+  try {
+    const res = await fetch("http://127.0.0.1:5000/api/chat_per_categoria");
+    if (res.ok) {
+      const json = await res.json();
+      this.categories = json.data || [];
+    }
+  } catch (e) {
+    console.error("Errore categorie:", e);
+  }
+},
+
+reloadGraph() {
+  this.loadGraph(50);
+},
 
     async fetchEdgeDetails(edge) {
       this.edgeMessages = [];
@@ -613,22 +637,36 @@ export default {
     },
 
     async loadGraph(limit = 300) {
-      try {
-        const res = await fetch(`http://127.0.0.1:5000/api/graph?limit=${limit}`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const json = await res.json();
-        this.lastJson = json;
-        this.exploredNodesDepth = {};
-        this.initialFocusId = null;
-        this.chatContext = null;
-        this.channelMessage = null;
-        this.stats = { nodes: (json.nodes || []).length, edges: (json.edges || []).length };
-        const processed = await this.processGraphData(json.nodes || [], json.edges || []);
-        this.nodesDS = new DataSet(processed.nodes);
-        this.edgesDS = new DataSet(processed.edges);
-        this.renderNetwork(this.nodesDS, this.edgesDS);
-      } catch (err) { console.error("Errore caricamento grafo:", err); this.showToast("Errore nel caricamento del grafo"); }
-    },
+  try {
+    // 1. Costruisci l'URL base con il limite
+    let url = `http://127.0.0.1:5000/api/graph?limit=${limit}`;
+
+    // 2. Aggiungi il parametro category se selezionato
+    if (this.selectedCategory) {
+      url += `&category=${encodeURIComponent(this.selectedCategory)}`;
+    }
+
+    // 3. Esegui la chiamata fetch all'URL aggiornato
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    
+    const json = await res.json();
+    this.lastJson = json;
+    this.exploredNodesDepth = {};
+    this.initialFocusId = null;
+    this.chatContext = null;
+    this.channelMessage = null;
+    this.stats = { nodes: (json.nodes || []).length, edges: (json.edges || []).length };
+    
+    const processed = await this.processGraphData(json.nodes || [], json.edges || []);
+    this.nodesDS = new DataSet(processed.nodes);
+    this.edgesDS = new DataSet(processed.edges);
+    this.renderNetwork(this.nodesDS, this.edgesDS);
+  } catch (err) { 
+    console.error("Errore caricamento grafo:", err); 
+    this.showToast("Errore nel caricamento del grafo"); 
+  }
+},
 
     getNodeColor(nodeId, isFocus = false) {
       const exploredDepth = this.getNodeExploredDepth(nodeId);
@@ -879,7 +917,9 @@ export default {
     showToast(msg, time = 2500) { this.toast = msg; setTimeout(() => (this.toast = ""), time); },
   },
 
-  mounted() { this.loadGraph(50); },
+  mounted() { 
+    this.fetchCategories();
+    this.loadGraph(50); },
 };
 </script>
 
@@ -1044,5 +1084,19 @@ export default {
   .legend { order: -1; }
   .graph-container { height: 50vh; }
   .edge-summary-visual { flex-direction: column; gap: 1rem; }
+}
+.category-select {
+  padding: 0.6rem;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  background: #fff;
+  font-size: 0.95rem;
+  max-width: 220px;
+  cursor: pointer;
+}
+
+.category-select:focus {
+  outline: none;
+  border-color: #3558ff;
 }
 </style>

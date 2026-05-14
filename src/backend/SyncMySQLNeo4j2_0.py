@@ -71,10 +71,11 @@ def sync_from_mysql():
     
     print("\n📊 ESTRAZIONE DA MYSQL...")
     
-    # Query per relazioni PER CHAT
+    # 🔹 MODIFICA: Join con tabella chat per prendere la categoria
     mysql_cur.execute("""
         SELECT 
             r.id_chat AS chatId,
+            COALESCE(c.categoria_chat, 'Altro') AS category,
             r.id_autore AS autore, 
             m.id_autore AS destinatario,
             COUNT(*) AS freq
@@ -82,13 +83,14 @@ def sync_from_mysql():
         JOIN messaggi m 
           ON r.reply_to_msg_id = m.id_messaggio
          AND r.id_chat = m.id_chat
+        JOIN chat c ON r.id_chat = c.id_chat
         WHERE r.reply_to_msg_id IS NOT NULL
           AND TRIM(r.reply_to_msg_id) != ''
           AND r.reply_to_msg_id != '0'
           AND m.id_autore > 0
           AND r.id_autore > 0
           AND r.id_autore <> m.id_autore
-        GROUP BY r.id_chat, r.id_autore, m.id_autore
+        GROUP BY r.id_chat, c.categoria_chat, r.id_autore, m.id_autore
     """)
     chat_rows = mysql_cur.fetchall()
     print(f"   Coppie per chat: {len(chat_rows)}")
@@ -114,16 +116,21 @@ def sync_from_mysql():
     global_rows = mysql_cur.fetchall()
     print(f"   Coppie globali: {len(global_rows)}")
     
-    # INSERIMENTO RELAZIONI PER CHAT
+    # INSERIMENTO RELAZIONI PER CHAT (CON CATEGORIA)
     print("\n📥 INSERIMENTO REPLIED_TO (per chat)...")
     for i in range(0, len(chat_rows), BATCH_SIZE):
         batch = chat_rows[i:i+BATCH_SIZE]
         
+        # 🔹 MODIFICA: Aggiunta property 'category' alla relazione
         run_query("""
             UNWIND $batch AS row
             MERGE (u1:Utente {id: row.autore})
             MERGE (u2:Utente {id: row.destinatario})
-            CREATE (u1)-[r:REPLIED_TO {chatId: row.chatId, count: row.freq}]->(u2)
+            CREATE (u1)-[r:REPLIED_TO {
+                chatId: row.chatId, 
+                category: row.category, 
+                count: row.freq
+            }]->(u2)
         """, {"batch": batch})
         
         print(f"   ✔ {min(i+BATCH_SIZE, len(chat_rows))}/{len(chat_rows)}")
@@ -214,7 +221,7 @@ def verify():
 
 def main():
     print("=" * 70)
-    print("🚀 SYNC NEO4J - RESET COMPLETO E RICALCOLO")
+    print("🚀 SYNC NEO4J - RESET COMPLETO CON CATEGORIE")
     print("=" * 70)
     print(f"⏰ Inizio: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     

@@ -1,5 +1,10 @@
 /* =========================
-   RESET & BASE
+   1. IMPORT & FONT
+========================= */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+/* =========================
+   2. RESET & BASE
 ========================= */
 * {
   margin: 0;
@@ -8,134 +13,249 @@
 }
 
 :root {
-  /* 🎨 Palette */
-  --color-primary: #0b3d91;
-  --color-primary-light: #e7f1ff;
-  --color-secondary: #0b7a4b;
-  --color-secondary-light: #e8faf1;
-  --color-bg: #f4f6f9;
-  --color-text: #333;
+  /* 🎨 Palette "Professional Blue" (Monocromatica) */
+  
+  /* BRANDING */
+  --color-primary: #0f172a;       /* Slate 900: Quasi nero/blu. Molto elegante per testi e navbar */
+  --color-primary-light: #f1f5f9; /* Slate 100: Sfondo chiarissimo, quasi bianco */
+  
+  /* AZIONI & ACCENTI */
+  --color-accent: #2563eb;        /* Royal Blue: Per bottoni e link attivi. Serio ma vibrante */
+  --color-accent-hover: #1d4ed8;  /* Versione più scura per hover */
+  
+  /* STATI */
+  --color-success: #10b981;       /* Verde smeraldo (non lime) */
+  --color-danger: #ef4444;        /* Rosso opaco */
+  --color-warning: #f59e0b;       /* Manteniamo per alert, ma usato pochissimo */
+
+  /* SFONDI & TESTO */
+  --color-bg: #f8fafc;            /* Sfondo pagina (Slate 50) - Molto riposante */
+  --color-card-bg: #ffffff;       /* Bianco puro per le card */
+  
+  --color-text: #334155;          /* Slate 700: Grigio scuro, più leggibile del nero assoluto */
+  --color-text-muted: #64748b;    /* Slate 500: Per etichette e sottotitoli */
+  
+  --border-color: #e2e8f0;        /* Grigio chiarissimo per linee sottili */
 
   /* 🔠 Tipografia */
-  --font-main: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  --font-main: 'Inter', system-ui, -apple-system, sans-serif;
 
   /* 📏 Spaziature */
-  --radius: 12px;
-  --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.08);
-  --shadow-lg: 0 6px 16px rgba(0, 0, 0, 0.12);
+  --radius: 12px;                 /* Raggio leggermente ridotto per look più "business" */
+  --header-height: 64px;
+  
+  /* 🌑 Ombre (Molto sottili e definite) */
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.05), 0 4px 6px -4px rgba(0, 0, 0, 0.02);
 }
 
 /* =========================
-   STRUTTURA GENERALE
+   3. STRUTTURA GENERALE
 ========================= */
 body {
   font-family: var(--font-main);
   background-color: var(--color-bg);
   color: var(--color-text);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
 }
 
 a {
   text-decoration: none;
   color: inherit;
+  transition: all 0.2s ease;
 }
 
 .page-container {
-  max-width: 1500px;
+  max-width: 1600px;
   margin: 0 auto;
-  padding: 80px 2rem 2rem; /* spazio sotto navbar */
+  padding: calc(var(--header-height) + 2rem) 2rem 2rem;
   min-height: 100vh;
 }
 
-/* =========================
-   TITOLI
-========================= */
-.page-title {
-  font-size: 1.8rem;
-  font-weight: bold;
+/* Titoli */
+h1, h2, h3, .page-title {
   color: var(--color-primary);
-  margin-bottom: 1rem;
+  font-weight: 700;
+  margin-bottom: 1.5rem;
+  letter-spacing: -0.01em; /* Tracking leggermente stretto per look moderno */
+}
+
+.page-title {
+  font-size: 1.875rem; /* 30px */
+  display: flex;
+  align-items: center;
+  gap: 1rem;
 }
 
 /* =========================
-   COMPONENTI UI
+   4. COMPONENTI UI (Clean Cards)
 ========================= */
-.card {
-  background: #fff;
+.card, .dashboard-card {
+  background: var(--color-card-bg);
+  /* Rimosso effetto glass pesante, ora è solido e pulito */
+  border: 1px solid var(--border-color);
   border-radius: var(--radius);
-  padding: 1rem 1.25rem;
+  padding: 1.5rem;
+  
   box-shadow: var(--shadow-sm);
-  margin-bottom: 12px;
+  margin-bottom: 24px;
   transition: transform 0.2s ease, box-shadow 0.2s ease;
 }
-.card:hover {
-  transform: translateY(-3px);
-  box-shadow: var(--shadow-lg);
+
+.card:hover, .dashboard-card:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+  border-color: #cbd5e1; /* Leggermente più scuro all'hover */
 }
 
+/* Badge / Pills */
 .pill {
-  padding: 2px 10px;
-  border-radius: 999px;
-  font-size: 0.8rem;
+  display: inline-flex;
+  align-items: center;
+  padding: 0.35rem 0.85rem;
+  border-radius: 6px; /* Meno arrotondato, più tecnico */
+  font-size: 0.75rem;
   font-weight: 600;
+  line-height: 1;
 }
-.pill-blue {
-  background: var(--color-primary-light);
-  color: var(--color-primary);
+
+.pill-blue { 
+  background: #eff6ff; 
+  color: var(--color-accent); 
+  border: 1px solid #dbeafe;
 }
-.pill-green {
-  background: var(--color-secondary-light);
-  color: var(--color-secondary);
+
+.pill-green { 
+  background: #ecfdf5; 
+  color: var(--color-success); 
+  border: 1px solid #d1fae5;
 }
 
 /* =========================
-   NAVBAR
+   5. NAVBAR (Minimal & Sticky)
 ========================= */
 .navbar {
   position: fixed;
   top: 0;
   left: 0;
   right: 0;
-  height: 60px;
-  background: #fff;
-  box-shadow: var(--shadow-sm);
+  height: var(--header-height);
+  
+  background: #ffffff;
+  border-bottom: 1px solid var(--border-color);
+  
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 0 2rem;
   z-index: 1000;
+  /* Ombra rimossa, solo bordo per pulizia */
 }
+
 .navbar-logo {
-  font-size: 1.2rem;
-  font-weight: bold;
+  font-size: 1.25rem;
+  font-weight: 700;
   color: var(--color-primary);
+  letter-spacing: -0.02em;
 }
+
 .navbar-links {
   display: flex;
-  gap: 1.5rem;
+  gap: 2.5rem;
 }
+
 .navbar-link {
-  color: var(--color-text);
+  color: var(--color-text-muted);
   font-weight: 500;
-  transition: color 0.2s;
+  font-size: 0.9rem;
+  position: relative;
+  padding: 0.5rem 0;
 }
+
 .navbar-link:hover {
   color: var(--color-primary);
 }
 
+.navbar-link.router-link-active {
+  color: var(--color-accent);
+  font-weight: 600;
+}
+
+/* Linea indicatrice attiva */
+.navbar-link.router-link-active::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: 2px;
+  background-color: var(--color-accent);
+  border-radius: 2px;
+}
+
 /* =========================
-   EXTRA
+   6. PRIMEVUE OVERRIDES (Tabelle Dati Professionali)
+========================= */
+/* Intestazione: Sfondo leggero, testo scuro */
+.p-datatable .p-datatable-thead > tr > th {
+  background: #f8fafc !important; 
+  color: var(--color-primary) !important;
+  font-weight: 600 !important;
+  font-size: 0.85rem !important;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-bottom: 1px solid var(--border-color) !important;
+  padding: 1rem !important;
+}
+
+/* Corpo: Bianco, pulito */
+.p-datatable .p-datatable-tbody > tr {
+  background: #ffffff !important;
+  color: var(--color-text) !important;
+  font-size: 0.95rem;
+}
+
+.p-datatable .p-datatable-tbody > tr > td {
+  border-bottom: 1px solid var(--border-color) !important;
+  padding: 1rem !important;
+}
+
+/* Riga Hover */
+.p-datatable .p-datatable-tbody > tr:hover {
+  background: #f1f5f9 !important; /* Slate 100 */
+}
+
+/* Input Search */
+.p-inputtext {
+  border-radius: 6px !important;
+  border: 1px solid var(--border-color) !important;
+  padding: 0.5rem 0.75rem !important;
+  font-size: 0.9rem !important;
+  color: var(--color-text);
+}
+
+.p-inputtext:focus {
+  border-color: var(--color-accent) !important;
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.1) !important; /* Alone blu molto soft */
+}
+
+/* =========================
+   7. SCROLLBAR & EXTRA
 ========================= */
 ::-webkit-scrollbar {
-  width: 8px;
+  width: 10px;
+  height: 10px;
 }
 ::-webkit-scrollbar-track {
-  background: var(--color-bg);
+  background: #f1f5f9;
 }
 ::-webkit-scrollbar-thumb {
-  background: var(--color-primary);
-  border-radius: 6px;
+  background: #cbd5e1;
+  border-radius: 5px;
+  border: 2px solid #f1f5f9; /* Crea margine attorno alla barra */
 }
-::selection {
-  background: var(--color-primary);
-  color: #fff;
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
 }

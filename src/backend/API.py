@@ -54,13 +54,30 @@ logger = logging.getLogger(__name__)
 
 def get_connection():
     """Connessione a MySQL."""
-    return mysql.connector.connect(
+    # Proviamo prima il connettore nativo (C-ext). Se si verifica l'errore
+    # relativo al plugin di autenticazione (es. "mysql_native_password"
+    # cannot be loaded: it is already loaded) facciamo fallback al driver
+    # Python puro per evitare conflitti di plugin su Windows.
+    conn_args = dict(
         host=os.getenv("DB_HOST", "localhost"),
         user=os.getenv("DB_USER", "root"),
         password=os.getenv("DB_PASSWORD", ""),
         database=os.getenv("DB_NAME", "analisiutentitelegram"),
         charset="utf8mb4"
     )
+    try:
+        return mysql.connector.connect(**conn_args)
+    except Exception as e:
+        msg = str(e)
+        if "mysql_native_password" in msg or "cannot be loaded" in msg:
+            logger.warning(
+                "Errore plugin autenticazione MySQL rilevato; ri-provo con use_pure=True"
+            )
+            # Forziamo il driver Python puro come fallback
+            conn_args["use_pure"] = True
+            return mysql.connector.connect(**conn_args)
+        # Se è un altro errore, rilanciamo per essere gestito a monte
+        raise
 
 
 def pag_params():
@@ -1492,50 +1509,67 @@ def suggerisci_chat_per_utente():
 @app.route("/api/graph", methods=["GET"])
 def api_graph():
     limit = int(request.args.get("limit", 50))
+    category = request.args.get("category")
 
-    # ✅ FIX: Somma entrambe le direzioni per ogni coppia
-    q = """
-    // Trovo gli utenti più connessi (grado più alto)
-    MATCH (u:Utente)-[r:REPLIED_TO_GLOBAL]-(v:Utente)
-    WHERE u.id IS NOT NULL AND v.id IS NOT NULL AND u.id <> v.id
-    WITH u, count(r) AS deg
-    ORDER BY deg DESC
-    LIMIT 10
+    if category:
+        q = """
+        MATCH (u:Utente)-[r:REPLIED_TO]-(v:Utente)
+        WHERE r.category = $category
+          AND u.id IS NOT NULL AND v.id IS NOT NULL AND u.id <> v.id
+        WITH u, count(r) AS deg
+        ORDER BY deg DESC
+        LIMIT 10
 
-    // Espando i loro collegamenti - SOMMA BIDIREZIONALE
-    MATCH (u)-[r:REPLIED_TO_GLOBAL]-(v:Utente)
-    WHERE u.id < v.id  // Evita duplicati (prendi solo una direzione della coppia)
-    WITH u, v, sum(r.count) AS peso
-    ORDER BY peso DESC
-    LIMIT $limit
+        MATCH (u)-[r:REPLIED_TO]-(v:Utente)
+        WHERE r.category = $category AND u.id < v.id
+        WITH u, v, sum(r.count) AS peso
+        ORDER BY peso DESC
+        LIMIT $limit
 
-    WITH collect({from: u.id, to: v.id, peso: peso}) AS rels,
-         collect(DISTINCT u) + collect(DISTINCT v) AS utenti
-    RETURN rels, utenti
-    """
+        WITH collect({from: u.id, to: v.id, peso: peso}) AS rels,
+             collect(DISTINCT u) + collect(DISTINCT v) AS utenti
+        RETURN rels, utenti
+        """
+        params = {"limit": limit, "category": category}
+    else:
+        q = """
+        MATCH (u:Utente)-[r:REPLIED_TO_GLOBAL]-(v:Utente)
+        WHERE u.id IS NOT NULL AND v.id IS NOT NULL AND u.id <> v.id
+        WITH u, count(r) AS deg
+        ORDER BY deg DESC
+        LIMIT 10
 
-    res = run_query(q, {"limit": limit})
+        MATCH (u)-[r:REPLIED_TO_GLOBAL]-(v:Utente)
+        WHERE u.id < v.id
+        WITH u, v, sum(r.count) AS peso
+        ORDER BY peso DESC
+        LIMIT $limit
+
+        WITH collect({from: u.id, to: v.id, peso: peso}) AS rels,
+             collect(DISTINCT u) + collect(DISTINCT v) AS utenti
+        RETURN rels, utenti
+        """
+        params = {"limit": limit}
+
+    res = run_query(q, params)
     if not res:
         return jsonify({"nodes": [], "edges": []})
 
     rels = res[0]["rels"]
     utenti = res[0]["utenti"]
 
-    connected_ids = {r["from"] for r in rels if r.get("from")} | {r["to"] for r in rels if r.get("to")}
+    connected_ids = {r["from"] for r in rels if r.get("from")} | \
+                    {r["to"] for r in rels if r.get("to")}
 
     nodes = []
     for u in utenti:
         if not u.get("id") or u["id"] not in connected_ids:
             continue
+
         nodes.append({
             "id": f"user_{u['id']}",
             "label": u.get("username") or str(u["id"]),
             "group": "Utente",
-            "color": {
-                "background": "#2ca02c", "border": "#145214",
-                "highlight": {"background": "#2ca02c", "border": "#145214"},
-                "hover": {"background": "#2ca02c", "border": "#145214"}
-            },
             "shape": "dot"
         })
 
@@ -1543,237 +1577,250 @@ def api_graph():
     for r in rels:
         if not r.get("from") or not r.get("to"):
             continue
-        edge_id = tuple(sorted([r["from"], r["to"]]))
-        if edge_id in seen_edges:
+
+        edge_key = tuple(sorted([r["from"], r["to"]]))
+        if edge_key in seen_edges:
             continue
-        seen_edges.add(edge_id)
+        seen_edges.add(edge_key)
+
         edges.append({
             "id": f"user_{r['from']}->user_{r['to']}",
             "from": f"user_{r['from']}",
             "to": f"user_{r['to']}",
-            "label": f"{r['peso']}",
+            "label": str(r["peso"]),
             "value": r["peso"]
         })
 
     return jsonify({"nodes": nodes, "edges": edges})
 
 
+# ===========================================================
+# =====================   FOCUS   ===========================
+# ===========================================================
+
 @app.route("/api/graph/focus", methods=["GET"])
 def api_graph_focus():
     focus_id = request.args.get("focusId")
     top = int(request.args.get("top", 5))
+    category = request.args.get("category")   # ✅ IMPORTANTE
 
     if not focus_id:
         return jsonify({"error": "focusId richiesto"}), 400
 
-    try:
-        fid = None
-        if focus_id.isdigit() or (focus_id.startswith("-") and focus_id[1:].isdigit()):
-            fid = int(focus_id)
-        else:
-            conn = get_connection()
-            cursor = conn.cursor(dictionary=True)
-            try:
-                cursor.execute(
-                    "SELECT id FROM utenti WHERE LOWER(username) = LOWER(%s)",
-                    (focus_id,)
-                )
-                row = cursor.fetchone()
-                if not row:
-                    return jsonify({"error": "Nessun utente trovato con username fornito"}), 404
-                fid = row["id"]
-            finally:
-                cursor.close()
-                conn.close()
-
+    # ---------- RISOLVO focusId ----------
+    if focus_id.isdigit() or (focus_id.startswith("-") and focus_id[1:].isdigit()):
+        fid = int(focus_id)
+    else:
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT id_chat, nome_chat FROM chat WHERE id_chat = %s", (fid,))
-        chat_row = cursor.fetchone()
-
-        # =====================================================
-        # 🟩 CASO CHAT
-        # =====================================================
-        if chat_row:
-            cursor.execute("""
-                SELECT m.id_autore AS id_utente, COUNT(*) AS messaggi
-                FROM messaggi m
-                WHERE m.id_chat = %s AND m.id_autore > 0
-                GROUP BY m.id_autore
-                ORDER BY messaggi DESC
-                LIMIT %s
-            """, (fid, top))
-            top_users = cursor.fetchall()
-
-            if not top_users:
-                cursor.close()
-                conn.close()
-                return jsonify({"nodes": [], "edges": [], "has_more": False})
-
-            user_ids = [r["id_utente"] for r in top_users]
-
-            placeholders = ",".join(["%s"] * len(user_ids))
-            cursor.execute(f"""
-                SELECT id, nome, username
-                FROM utenti
-                WHERE id IN ({placeholders})
-            """, tuple(user_ids))
-            user_infos = {u["id"]: u for u in cursor.fetchall()}
-
+        try:
+            cursor.execute(
+                "SELECT id FROM utenti WHERE LOWER(username) = LOWER(%s)",
+                (focus_id,)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return jsonify({"error": "Nessun utente trovato"}), 404
+            fid = row["id"]
+        finally:
             cursor.close()
             conn.close()
 
-            nodes = []
-            for r in top_users:
-                uid = r["id_utente"]
-                info = user_infos.get(uid, {})
-                label = info.get("username") or info.get("nome") or str(uid)
-                nodes.append({
-                    "id": f"user_{uid}",
-                    "label": label,
-                    "group": "Utente",
-                    "title": f"{label}\nMessaggi in chat: {r['messaggi']}",
-                    "value": r['messaggi']
-                })
+    # =====================================================
+    # CASO CHAT (focusId è una chat)
+    # =====================================================
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT id_chat, nome_chat FROM chat WHERE id_chat = %s", (fid,))
+    chat_row = cursor.fetchone()
 
-            # ✅ FIX: Query con somma bidirezionale
-            q_edges = """
-            UNWIND $ids AS uid1
-            UNWIND $ids AS uid2
-            WITH uid1, uid2
-            WHERE uid1 < uid2
-            OPTIONAL MATCH (u1:Utente {id: uid1})-[r1:REPLIED_TO_GLOBAL]->(u2:Utente {id: uid2})
-            OPTIONAL MATCH (u2b:Utente {id: uid2})-[r2:REPLIED_TO_GLOBAL]->(u1b:Utente {id: uid1})
-            WITH uid1 AS da, uid2 AS a, 
-                 coalesce(r1.count, 0) + coalesce(r2.count, 0) AS peso
-            WHERE peso > 0
-            RETURN da, a, peso
-            """
-            res_edges = run_query(q_edges, {"ids": user_ids}) or []
+    if chat_row:
+        cursor.execute("""
+            SELECT m.id_autore AS id_utente, COUNT(*) AS messaggi
+            FROM messaggi m
+            WHERE m.id_chat = %s AND m.id_autore > 0
+            GROUP BY m.id_autore
+            ORDER BY messaggi DESC
+            LIMIT %s
+        """, (fid, top))
+        top_users = cursor.fetchall()
 
-            edges = [
-                {
-                    "id": f"user_{r['da']}->user_{r['a']}",
-                    "from": f"user_{r['da']}",
-                    "to": f"user_{r['a']}",
-                    "label": f"{r['peso']}",
-                    "value": r["peso"]
-                }
-                for r in res_edges
-            ]
+        if not top_users:
+            cursor.close()
+            conn.close()
+            return jsonify({"nodes": [], "edges": [], "has_more": False})
 
-            return jsonify({
-                "nodes": list({n["id"]: n for n in nodes}.values()),
-                "edges": list({e["id"]: e for e in edges}.values()),
-                "has_more": len(top_users) == top
+        user_ids = [r["id_utente"] for r in top_users]
+
+        placeholders = ",".join(["%s"] * len(user_ids))
+        cursor.execute(f"""
+            SELECT id, nome, username
+            FROM utenti
+            WHERE id IN ({placeholders})
+        """, tuple(user_ids))
+        user_infos = {u["id"]: u for u in cursor.fetchall()}
+
+        cursor.close()
+        conn.close()
+
+        nodes = []
+        for r in top_users:
+            uid = r["id_utente"]
+            info = user_infos.get(uid, {})
+            label = info.get("username") or info.get("nome") or str(uid)
+
+            nodes.append({
+                "id": f"user_{uid}",
+                "label": label,
+                "group": "Utente",
+                "title": f"{label}\nMessaggi: {r['messaggi']}",
+                "value": r['messaggi']
             })
 
-        # =====================================================
-        # 🟦 CASO UTENTE
-        # =====================================================
-        else:
-            cursor.close()
-            conn.close()
-            params = {"focusId": fid, "top": top}
+        q_edges = """
+        UNWIND $ids AS uid1
+        UNWIND $ids AS uid2
+        WITH uid1, uid2
+        WHERE uid1 < uid2
 
-            # ✅ FIX: Query top vicini con somma bidirezionale
-            q = """
-            MATCH (u:Utente {id:$focusId})-[r:REPLIED_TO_GLOBAL]-(v:Utente)
-            WHERE v.id IS NOT NULL AND u.id <> v.id
-            WITH v, sum(r.count) AS totReply
-            ORDER BY totReply DESC
-            LIMIT $top
-            RETURN v.id AS vicino, totReply
-            """
-            top_nodes = run_query(q, params) or []
+        OPTIONAL MATCH (u1:Utente {id: uid1})-[r1:REPLIED_TO_GLOBAL]->(u2:Utente {id: uid2})
+        OPTIONAL MATCH (u2b:Utente {id: uid2})-[r2:REPLIED_TO_GLOBAL]->(u1b:Utente {id: uid1})
 
-            if not top_nodes:
-                return jsonify({"nodes": [], "edges": [], "has_more": False})
+        WITH uid1 AS da, uid2 AS a,
+             coalesce(r1.count, 0) + coalesce(r2.count, 0) AS peso
+        WHERE peso > 0
+        RETURN da, a, peso
+        """
 
-            top_ids = [r["vicino"] for r in top_nodes]
+        res_edges = run_query(q_edges, {"ids": user_ids}) or []
 
-            # ✅ FIX: Query archi con somma bidirezionale esplicita
-            q_edges = """
-            UNWIND $topIds AS vid
-            OPTIONAL MATCH (u:Utente {id:$focusId})-[r1:REPLIED_TO_GLOBAL]->(v:Utente {id: vid})
-            OPTIONAL MATCH (v2:Utente {id: vid})-[r2:REPLIED_TO_GLOBAL]->(u2:Utente {id:$focusId})
-            WITH vid,
-                 coalesce(r1.count, 0) + coalesce(r2.count, 0) AS peso
-            WHERE peso > 0
-            WITH 
-                CASE WHEN $focusId < vid THEN $focusId ELSE vid END AS da,
-                CASE WHEN $focusId < vid THEN vid ELSE $focusId END AS a,
-                peso
-            RETURN DISTINCT da, a, peso
-            """
-            res_edges = run_query(q_edges, {"focusId": fid, "topIds": top_ids}) or []
+        edges = [
+            {
+                "id": f"user_{r['da']}->user_{r['a']}",
+                "from": f"user_{r['da']}",
+                "to": f"user_{r['a']}",
+                "label": str(r["peso"]),
+                "value": r["peso"]
+            }
+            for r in res_edges
+        ]
 
-            all_ids = list(set(top_ids + [fid]))
-            conn = get_connection()
-            cursor = conn.cursor(dictionary=True)
-            placeholders = ",".join(["%s"] * len(all_ids))
-            cursor.execute(f"""
-                SELECT id, nome, username
-                FROM utenti
-                WHERE id IN ({placeholders})
-            """, tuple(all_ids))
-            user_infos = {u["id"]: u for u in cursor.fetchall()}
-            cursor.close()
-            conn.close()
+        return jsonify({
+            "nodes": list({n["id"]: n for n in nodes}.values()),
+            "edges": list({e["id"]: e for e in edges}.values()),
+            "has_more": len(top_users) == top
+        })
 
-            nodes = []
-            for uid in all_ids:
-                info = user_infos.get(uid, {})
-                label = info.get("username") or info.get("nome") or str(uid)
-                is_focus = (uid == fid)
-                
-                node = {
-                    "id": f"user_{uid}",
-                    "label": label,
-                    "group": "Utente",
-                    "title": f"{label}" + (" (focus)" if is_focus else "")
-                }
-                
-                if is_focus:
-                    node["color"] = {
-                        "background": "#ff6b6b",
-                        "border": "#c92a2a",
-                        "highlight": {"background": "#ff8787", "border": "#e03131"},
-                        "hover": {"background": "#ffa8a8", "border": "#e03131"}
-                    }
-                
-                nodes.append(node)
+    # =====================================================
+    # CASO UTENTE
+    # =====================================================
+    cursor.close()
+    conn.close()
 
-            edges = []
-            seen_edges = set()
-            for r in res_edges:
-                da = r["da"]
-                a = r["a"]
-                peso = r["peso"]
-                
-                edge_key = (min(da, a), max(da, a))
-                
-                if edge_key in seen_edges:
-                    continue
-                seen_edges.add(edge_key)
-                
-                edges.append({
-                    "id": f"user_{da}->user_{a}",
-                    "from": f"user_{da}",
-                    "to": f"user_{a}",
-                    "label": f"{peso}",
-                    "value": peso
-                })
+    params = {"focusId": fid, "top": top}
 
-            return jsonify({
-                "nodes": list({n["id"]: n for n in nodes}.values()),
-                "edges": edges,
-                "has_more": len(top_nodes) == top
-            })
+    if category:
+        rel_type = "REPLIED_TO"
+        node_filter = "WHERE r.category = $category"
+        edge_filter1 = "WHERE r1.category = $category"
+        edge_filter2 = "WHERE r2.category = $category"
+        params["category"] = category
+    else:
+        rel_type = "REPLIED_TO_GLOBAL"
+        node_filter = ""
+        edge_filter1 = ""
+        edge_filter2 = ""
 
-    except Exception as e:
-        logger.error(f"Errore in api_graph_focus: {e}", exc_info=True)
-        return jsonify({"error": "Errore interno del server"}), 500
+    # 1️⃣ Trovo vicini top
+    q = f"""
+    MATCH (u:Utente {{id:$focusId}})-[r:{rel_type}]-(v:Utente)
+    {node_filter}
+    WHERE v.id IS NOT NULL AND u.id <> v.id
+    WITH v, sum(r.count) AS totReply
+    ORDER BY totReply DESC
+    LIMIT $top
+    RETURN v.id AS vicino, totReply
+    """
+
+    top_nodes = run_query(q, params) or []
+
+    if not top_nodes:
+        return jsonify({"nodes": [], "edges": [], "has_more": False})
+
+    top_ids = [r["vicino"] for r in top_nodes]
+    params["topIds"] = top_ids
+
+    # 2️⃣ Archi bidirezionali
+    q_edges = f"""
+    UNWIND $topIds AS vid
+
+    OPTIONAL MATCH (u:Utente {{id:$focusId}})-[r1:{rel_type}]->(v:Utente {{id: vid}})
+    {edge_filter1}
+
+    OPTIONAL MATCH (v2:Utente {{id: vid}})-[r2:{rel_type}]->(u2:Utente {{id:$focusId}})
+    {edge_filter2}
+
+    WITH vid,
+         coalesce(r1.count, 0) + coalesce(r2.count, 0) AS peso
+    WHERE peso > 0
+
+    WITH 
+        CASE WHEN $focusId < vid THEN $focusId ELSE vid END AS da,
+        CASE WHEN $focusId < vid THEN vid ELSE $focusId END AS a,
+        peso
+    RETURN DISTINCT da, a, peso
+    """
+
+    res_edges = run_query(q_edges, params) or []
+
+    # 3️⃣ Info utenti da MySQL
+    all_ids = list(set(top_ids + [fid]))
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    placeholders = ",".join(["%s"] * len(all_ids))
+    cursor.execute(
+        f"SELECT id, nome, username FROM utenti WHERE id IN ({placeholders})",
+        tuple(all_ids)
+    )
+    user_infos = {u["id"]: u for u in cursor.fetchall()}
+    cursor.close()
+    conn.close()
+
+    nodes = []
+    for uid in all_ids:
+        info = user_infos.get(uid, {})
+        label = info.get("username") or info.get("nome") or str(uid)
+
+        nodes.append({
+            "id": f"user_{uid}",
+            "label": label,
+            "group": "Utente",
+            "title": label + (" (focus)" if uid == fid else "")
+        })
+
+    edges = []
+    seen_edges = set()
+    for r in res_edges:
+        da, a, peso = r["da"], r["a"], r["peso"]
+        edge_key = (min(da, a), max(da, a))
+        if edge_key in seen_edges:
+            continue
+        seen_edges.add(edge_key)
+
+        edges.append({
+            "id": f"user_{da}->user_{a}",
+            "from": f"user_{da}",
+            "to": f"user_{a}",
+            "label": str(peso),
+            "value": peso
+        })
+
+    return jsonify({
+        "nodes": list({n["id"]: n for n in nodes}.values()),
+        "edges": edges,
+        "has_more": len(top_nodes) == top
+    })
 
 # =========================
 # Top utenti 
@@ -1931,52 +1978,70 @@ def get_chat_per_categoria():
 @app.route("/api/graph/keyword", methods=["GET"])
 def api_graph_keyword():
     keyword = request.args.get("term", "").strip()
+    category = request.args.get("category")
+
     if not keyword:
         return jsonify({"nodes": [], "edges": [], "keyword_edges": [], "keyword_stats": {}}), 400
 
-    # Parametri di riduzione dei nodi
-    max_users   = int(request.args.get("maxUsers", 50))
-    min_count   = int(request.args.get("minCount", 1))
+    max_users = int(request.args.get("maxUsers", 50))
+    min_count = int(request.args.get("minCount", 1))
     max_targets = int(request.args.get("maxTargets", 30))
 
     kw = keyword.lower()
-    
-    # Connessione al DB
+
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
 
     try:
-        # ============================================================
-        # 1️⃣ TOP UTENTI con Keyword (Usando indice FULLTEXT)
-        # ============================================================
-        cursor.execute("""
-            SELECT id_autore, 
+        # ============================
+        # 1️⃣ TOP UTENTI CON KEYWORD
+        # ============================
+
+        cat_join = ""
+        cat_where = ""
+        params_mysql = [kw, kw, kw]
+
+        if category:
+            cat_join = "JOIN chat c ON m.id_chat = c.id_chat"
+            cat_where = "AND c.categoria_chat = %s"
+            params_mysql.append(category)
+
+        params_mysql.extend([min_count, max_users])
+
+        cursor.execute(f"""
+            SELECT m.id_autore, 
                    COUNT(*) AS kw_count,
-                   SUM(LENGTH(testo) - LENGTH(REPLACE(LOWER(testo), %s, ''))) / LENGTH(%s) AS kw_frequency
-            FROM messaggi
-            WHERE id_autore IS NOT NULL
-              AND id_autore > 0
-              AND MATCH(testo) AGAINST(%s IN BOOLEAN MODE)
-            GROUP BY id_autore
+                   SUM(LENGTH(m.testo) - LENGTH(REPLACE(LOWER(m.testo), %s, ''))) 
+                   / LENGTH(%s) AS kw_frequency
+            FROM messaggi m
+            {cat_join}
+            WHERE m.id_autore IS NOT NULL
+              AND m.id_autore > 0
+              AND MATCH(m.testo) AGAINST(%s IN BOOLEAN MODE)
+              {cat_where}
+            GROUP BY m.id_autore
             HAVING kw_count >= %s
             ORDER BY kw_frequency DESC, kw_count DESC
             LIMIT %s
-        """, (kw, kw, kw, min_count, max_users))
+        """, tuple(params_mysql))
 
         raw_users = cursor.fetchall()
 
         if not raw_users:
-            return jsonify({
-                "nodes": [], "edges": [], "keyword_edges": [], "keyword_stats": {}
-            })
+            return jsonify({"nodes": [], "edges": [], "keyword_edges": [], "keyword_stats": {}})
 
         user_ids_kw = [u["id_autore"] for u in raw_users]
         keyword_stats = {u["id_autore"]: int(u["kw_count"]) for u in raw_users}
 
-        # ============================================================
-        # 2️⃣ RELAZIONI AGGREGATE (Evitando duplicati con id_autore < id_autore2)
-        # ============================================================
+        # ============================
+        # 2️⃣ RELAZIONI AGGREGATE (MySQL)
+        # ============================
+
         placeholders = ",".join(["%s"] * len(user_ids_kw))
+
+        params_rel = [kw, kw] + user_ids_kw + user_ids_kw + [kw, kw]
+        if category:
+            params_rel.append(category)
 
         cursor.execute(f"""
             SELECT 
@@ -1986,7 +2051,10 @@ def api_graph_keyword():
                 SUM(CASE WHEN MATCH(m.testo) AGAINST(%s IN BOOLEAN MODE) THEN 1 ELSE 0 END) AS kw_in_reply,
                 SUM(CASE WHEN MATCH(m2.testo) AGAINST(%s IN BOOLEAN MODE) THEN 1 ELSE 0 END) AS kw_in_original
             FROM messaggi m
-            JOIN messaggi m2 ON m.reply_to_msg_id = m2.id_messaggio AND m.id_chat = m2.id_chat
+            JOIN messaggi m2 
+              ON m.reply_to_msg_id = m2.id_messaggio 
+             AND m.id_chat = m2.id_chat
+            {cat_join}
             WHERE m.id_autore IS NOT NULL 
               AND m.id_autore > 0
               AND m2.id_autore IS NOT NULL
@@ -1994,90 +2062,106 @@ def api_graph_keyword():
               AND m.id_autore <> m2.id_autore
               AND (
                   m.id_autore IN ({placeholders}) 
-                 OR m2.id_autore IN ({placeholders})
+                  OR m2.id_autore IN ({placeholders})
               )
               AND (
                   MATCH(m.testo) AGAINST(%s IN BOOLEAN MODE)
-                 OR MATCH(m2.testo) AGAINST(%s IN BOOLEAN MODE)
+                  OR MATCH(m2.testo) AGAINST(%s IN BOOLEAN MODE)
               )
+              {cat_where}
             GROUP BY da, a
             HAVING kw_count_rel > 0
-        """, (kw, kw, *user_ids_kw, *user_ids_kw, kw, kw))
+        """, tuple(params_rel))
 
         kw_rel_aggregated = cursor.fetchall()
 
-        # Mappa per contare i destinatari più frequenti
+        # Conta i destinatari più attivi
         target_count_map = {}
         for r in kw_rel_aggregated:
-            da = r["da"]
-            a = r["a"]
-            count = r["kw_count_rel"]
-            target_count_map[da] = target_count_map.get(da, 0) + count
-            target_count_map[a] = target_count_map.get(a, 0) + count
+            target_count_map[r["da"]] = target_count_map.get(r["da"], 0) + r["kw_count_rel"]
+            target_count_map[r["a"]] = target_count_map.get(r["a"], 0) + r["kw_count_rel"]
 
-        # Prendi solo i top destinatari per non affollare il grafo
-        top_targets = sorted(target_count_map, key=target_count_map.get, reverse=True)[:max_targets]
+        top_targets = sorted(
+            target_count_map, 
+            key=target_count_map.get, 
+            reverse=True
+        )[:max_targets]
+
         target_set = set(top_targets)
 
-        # Filtra le relazioni per mantenere solo quelle rilevanti
         kw_rel_filtered = [
-            r for r in kw_rel_aggregated 
+            r for r in kw_rel_aggregated
             if r["da"] in target_set and r["a"] in target_set
         ]
 
-        # ============================================================
-        # 3️⃣ NODI DA INCLUDERE E NOMI (Gestione Fantasmi/Canali inclusa)
-        # ============================================================
+        # ============================
+        # 3️⃣ NODI E NOMI
+        # ============================
+
         all_user_ids = sorted(set(user_ids_kw) | target_set)
 
-        if not all_user_ids:
-            return jsonify({
-                "nodes": [], "edges": [], "keyword_edges": [], "keyword_stats": keyword_stats
-            })
-
         placeholders_users = ",".join(["%s"] * len(all_user_ids))
-        
-        # Recupera nomi da UTENTI
-        cursor.execute(f"SELECT id, nome, username FROM utenti WHERE id IN ({placeholders_users})", tuple(all_user_ids))
+
+        cursor.execute(
+            f"SELECT id, nome, username FROM utenti WHERE id IN ({placeholders_users})",
+            tuple(all_user_ids)
+        )
         user_map = {u["id"]: u for u in cursor.fetchall()}
-        
-        # Recupera nomi da CHAT (per i canali/fantasmi)
-        cursor.execute(f"SELECT id_chat as id, nome_chat as nome FROM chat WHERE id_chat IN ({placeholders_users})", tuple(all_user_ids))
+
+        cursor.execute(
+            f"SELECT id_chat as id, nome_chat as nome FROM chat WHERE id_chat IN ({placeholders_users})",
+            tuple(all_user_ids)
+        )
         chat_map = {c["id"]: c for c in cursor.fetchall()}
 
-        # ============================================================
-        # 4️⃣ RELAZIONI COMPLETE DA NEO4J (Opzionale - per contesto)
-        # ============================================================
-        q_edges_keyword_fix = """
+        # ============================
+        # 4️⃣ RELAZIONI NEO4J (CORRETTE)
+        # ============================
+
+        neo_params = {"ids": all_user_ids}
+
+        if category:
+            rel_type = "REPLIED_TO"
+            where_edge1 = "WHERE r1.category = $category"
+            where_edge2 = "WHERE r2.category = $category"
+            neo_params["category"] = category
+        else:
+            rel_type = "REPLIED_TO_GLOBAL"
+            where_edge1 = ""
+            where_edge2 = ""
+
+        q_edges_keyword_fix = f"""
         UNWIND $ids AS uid1
         UNWIND $ids AS uid2
         WITH uid1, uid2
         WHERE uid1 < uid2
-        OPTIONAL MATCH (u1:Utente {id: uid1})-[r1:REPLIED_TO_GLOBAL]->(u2:Utente {id: uid2})
-        OPTIONAL MATCH (u2b:Utente {id: uid2})-[r2:REPLIED_TO_GLOBAL]->(u1b:Utente {id: uid1})
+
+        OPTIONAL MATCH (u1:Utente {{id: uid1}})-[r1:{rel_type}]->(u2:Utente {{id: uid2}})
+        {where_edge1}
+
+        OPTIONAL MATCH (u2b:Utente {{id: uid2}})-[r2:{rel_type}]->(u1b:Utente {{id: uid1}})
+        {where_edge2}
+
         WITH uid1 AS da, uid2 AS a, 
-            coalesce(r1.count, 0) + coalesce(r2.count, 0) AS peso
+             coalesce(r1.count, 0) + coalesce(r2.count, 0) AS peso
         WHERE peso > 0
         RETURN da, a, peso
         """
-        neo_edges = run_query(q_edges_keyword_fix, {"ids": all_user_ids}) or []
+
+        neo_edges = run_query(q_edges_keyword_fix, neo_params) or []
 
         kw_pairs = set((r["da"], r["a"]) for r in kw_rel_filtered)
 
-        # ============================================================
+        # ============================
         # 5️⃣ COSTRUZIONE JSON FINALE
-        # ============================================================
+        # ============================
+
         nodes = []
         for uid in all_user_ids:
-            # Logica di recupero nome: Utente -> Chat -> Fallback
             if uid in user_map:
-                u = user_map[uid]
-                label = u.get("username") or u.get("nome") or str(uid)
-            elif uid in chat_map:
-                c = chat_map[uid]
-                label = (c.get("nome") or f"Canale {uid}") + " (Canale)"
+                label = user_map[uid].get("username") or user_map[uid].get("nome")
             else:
-                label = f"Canale Esterno {uid}" if uid < 0 else f"Utente {uid}"
+                label = chat_map.get(uid, {}).get("nome", f"Utente {uid}")
 
             kw_count = keyword_stats.get(uid, 0)
 
@@ -2090,45 +2174,40 @@ def api_graph_keyword():
                 "title": f"{label}\n{kw_count} occorrenze" if kw_count > 0 else label
             })
 
-        # Archi generici (per contesto - opzionale)
         edges = []
-        if neo_edges:
-            for r in neo_edges:
-                da = r["da"]
-                a = r["a"]
-                peso = r["peso"]
-                edges.append({
-                    "id": f"e_{da}_{a}",
-                    "from": f"user_{da}",
-                    "to": f"user_{a}",
-                    "value": peso,
-                    "label": f"{peso}",
-                    "hasKeyword": (da, a) in kw_pairs or (a, da) in kw_pairs
-                })
+        for r in neo_edges:
+            da, a, peso = r["da"], r["a"], r["peso"]
 
-        # Archi specifici della keyword
+            edges.append({
+                "id": f"e_{da}_{a}",
+                "from": f"user_{da}",
+                "to": f"user_{a}",
+                "value": peso,
+                "label": str(peso),
+                "hasKeyword": (da, a) in kw_pairs or (a, da) in kw_pairs
+            })
+
         keyword_edges = []
         for r in kw_rel_filtered:
-            da = r["da"]
-            a = r["a"]
+            da, a = r["da"], r["a"]
             count = r["kw_count_rel"]
             kw_total = r["kw_in_reply"] + r["kw_in_original"]
-            
+
             keyword_edges.append({
                 "id": f"kw_{da}_{a}",
                 "from": f"user_{da}",
                 "to": f"user_{a}",
                 "value": count,
-                "label": f"{count}",
+                "label": str(count),
                 "hasKeyword": True,
-                "kw_in_reply": r["kw_in_reply"], 
+                "kw_in_reply": r["kw_in_reply"],
                 "kw_in_original": r["kw_in_original"],
                 "keyword_total": kw_total
             })
 
         return jsonify({
             "nodes": nodes,
-            "edges": edges, 
+            "edges": edges,
             "keyword_edges": keyword_edges,
             "keyword_stats": keyword_stats
         })
@@ -2136,13 +2215,14 @@ def api_graph_keyword():
     except Exception as e:
         logger.error(f"Errore in api_graph_keyword: {e}", exc_info=True)
         return jsonify({"error": "Errore interno del server"}), 500
-    
+
     finally:
         try:
             cursor.close()
             conn.close()
         except:
             pass
+
 
 @app.route("/api/admins/<int:chat_id>", methods=["GET"])
 def get_admins(chat_id):
@@ -2377,6 +2457,7 @@ def get_utente_storico(user_id):
     finally:
         cursor.close()
         conn.close()
+        
     
     
 # =========================
