@@ -1,6 +1,12 @@
 <template>
-  <div>
-    <h1 class="page-title">Lista Chat Scansionate</h1>
+  <div class="app-section chats-page">
+    <header class="app-page-header">
+      <div>
+        <span class="app-eyebrow">Conversation intelligence</span>
+        <h1 class="page-title">Chat analizzate</h1>
+        <p class="app-page-description">Consulta gruppi e canali importati, amministratori e stato dell'ultima scansione.</p>
+      </div>
+    </header>
 
     <div class="filter-row">
       <label for="categoria">Categoria:</label>
@@ -243,27 +249,24 @@ export default {
 
 /* TITOLI */
 .page-title {
-  font-size: 2rem;
+  font-size: clamp(2rem, 3vw, 2.65rem);
   font-weight: 700;
   color: var(--chat-text);
-  margin-bottom: 2rem;
-  letter-spacing: -0.5px;
-  background: linear-gradient(135deg, #1e293b 0%, #475569 100%);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
+  margin: 0 0 0.35rem;
+  letter-spacing: -0.04em;
+  line-height: 1.08;
 }
 
 /* FILTRO CATEGORIE */
 .filter-row {
-  margin-bottom: 2rem;
+  margin-bottom: 1rem;
   display: flex;
   align-items: center;
   gap: 1rem;
-  padding: 1.5rem;
+  padding: 0.9rem 1rem;
   background: var(--chat-card-bg);
-  border-radius: var(--chat-radius);
-  box-shadow: var(--chat-shadow-sm);
+  border-radius: 15px;
+  box-shadow: 0 4px 18px rgba(15,23,42,0.045);
   border: 1px solid var(--chat-border);
   transition: var(--chat-transition);
 }
@@ -282,17 +285,18 @@ export default {
 }
 
 .select-cat {
-  padding: 0.65rem 2.5rem 0.65rem 1rem;
-  border-radius: 10px;
-  border: 2px solid var(--chat-border);
-  background: #ffffff;
+  height: 42px;
+  padding: 0 2.5rem 0 0.85rem;
+  border-radius: 9px;
+  border: 1px solid #dbe3ed;
+  background-color: #f8fafc;
   font-size: 0.95rem;
   font-weight: 500;
   color: var(--chat-text);
   outline: none;
   transition: var(--chat-transition);
   min-width: 200px;
-  box-shadow: var(--chat-shadow-sm);
+  box-shadow: none;
   cursor: pointer;
   appearance: none;
   background-image: url("data:image/svg+xml;utf8,<svg fill='%23475569' height='20' viewBox='0 0 24 24' width='20' xmlns='http://www.w3.org/2000/svg'><path d='M7 10l5 5 5-5z'/></svg>");
@@ -317,18 +321,20 @@ export default {
 .chat-list {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-  gap: 1.5rem;
-  margin-bottom: 2rem;
+  gap: 0.8rem;
+  margin-bottom: 1rem;
 }
 
 .chat-item {
   background: var(--chat-card-bg);
-  border-radius: var(--chat-radius);
-  padding: 1.5rem;
+  min-height: 122px;
+  margin: 0;
+  border-radius: 14px;
+  padding: 1rem;
   cursor: pointer;
   transition: var(--chat-transition);
-  border: 2px solid transparent;
-  box-shadow: var(--chat-shadow-sm);
+  border: 1px solid #e2e8f0;
+  box-shadow: 0 3px 12px rgba(15,23,42,0.04);
   position: relative;
   overflow: hidden;
 
@@ -355,9 +361,9 @@ export default {
 }
 
 .chat-item:hover {
-  transform: translateY(-4px);
-  box-shadow: var(--chat-shadow-lg);
-  border-color: var(--chat-border);
+  transform: translateY(-2px);
+  box-shadow: 0 10px 24px rgba(15,23,42,0.08);
+  border-color: #c7d2fe;
 }
 
 .chat-item:active {

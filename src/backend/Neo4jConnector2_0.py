@@ -1,10 +1,15 @@
 # Neo4jConnector2_0.py
+import os
+
 from neo4j import GraphDatabase
 
 # Connessione al database Neo4j (istanza analisiutentitelegram2.0)
 _driver = GraphDatabase.driver(
-    "bolt://127.0.0.1:7687",  # URI locale (porta Bolt)
-    auth=("neo4j", "analisi2.0")  # user e password definiti in fase di creazione istanza
+    os.getenv("NEO4J_URI", "bolt://127.0.0.1:7687"),
+    auth=(
+        os.getenv("NEO4J_USER", "neo4j"),
+        os.getenv("NEO4J_PASSWORD", "analisi2.0"),
+    ),
 )
 
 # Messaggio di log

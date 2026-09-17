@@ -1,45 +1,76 @@
 <template>
   <div class="graph-page">
-    <h1 class="page-title">Visualizzazione modello a grafo</h1>
-    <p class="page-description">
-      Questa dashboard mostra un estratto casuale delle interazioni più rilevanti tra utenti su Telegram,
-      calcolate in base al numero di <strong>reply</strong> scambiati (peso).
-    </p>
+    <header class="graph-header">
+      <div>
+        <span class="eyebrow">Network intelligence</span>
+        <h1 class="page-title">Rete delle interazioni</h1>
+        <p class="page-description">
+          Esplora comunità, utenti ponte e intensità dei reply nell'ecosistema Telegram analizzato.
+        </p>
+      </div>
+      <div class="graph-health" :class="{ loading: isGraphLoading }">
+        <span class="health-dot"></span>
+        {{ isGraphLoading ? 'Aggiornamento in corso' : 'Grafo operativo' }}
+      </div>
+    </header>
 
     <div v-if="stats" class="stats-box">
-      <div class="stat-item"><strong>{{ stats.nodes }}</strong> Nodi</div>
-      <div class="stat-item"><strong>{{ stats.edges }}</strong> Relazioni (archi)</div>
+      <div class="stat-item"><span class="stat-icon nodes">●</span><div><small>Nodi visibili</small><strong>{{ stats.nodes }}</strong></div></div>
+      <div class="stat-item"><span class="stat-icon edges">⌁</span><div><small>Relazioni</small><strong>{{ stats.edges }}</strong></div></div>
+      <div v-if="communityAnalysis" class="stat-item"><span class="stat-icon communities">◈</span><div><small>Comunità rilevate</small><strong>{{ communityAnalysis.summary.community_count }}</strong></div></div>
+      <div v-if="communityAnalysis" class="stat-item"><span class="stat-icon largest">◎</span><div><small>Comunità maggiore</small><strong>{{ communityAnalysis.summary.largest_community }}</strong></div></div>
+      <div v-if="relationshipQuality" class="stat-item">
+        <span class="stat-icon quality">↔</span><div><small>Relazioni reciproche</small><strong>{{ relationshipQuality.percentage }}%</strong></div>
+      </div>
     </div>
 
-    <div class="search-bar">
-      <select v-model="selectedCategory" @change="reloadGraph" class="category-select">
-      <option value=""> Tutte le categorie</option>
-      <option v-for="cat in categories" :key="cat.categoria_chat" :value="cat.categoria_chat">
-        {{ cat.categoria_chat }} ({{ cat.totale }})
-      </option>
-      </select>
+    <section class="graph-toolbar">
+      <div class="toolbar-search">
+        <label class="field-group category-field">
+          <span>Ambito</span>
+          <select v-model="selectedCategory" @change="reloadGraph" class="category-select">
+            <option value="">Tutte le categorie</option>
+            <option v-for="cat in categories" :key="cat.categoria_chat" :value="cat.categoria_chat">
+              {{ cat.categoria_chat }} ({{ cat.totale }})
+            </option>
+          </select>
+        </label>
 
-      <input
-        v-model="query"
-        class="search-input"
-        type="text"
-        placeholder="🔎 Inserisci ID o username di un utente o di una chat per esplorare il grafo"
-        @keyup.enter="searchUserReplies"
-      />
+        <label class="field-group search-field">
+          <span>Cerca nel grafo</span>
+          <div class="search-input-wrap">
+            <span class="search-icon">⌕</span>
+            <input
+              v-model="query"
+              class="search-input"
+              type="text"
+              placeholder="ID, username oppure chat"
+              @keyup.enter="searchUserReplies"
+            />
+          </div>
+        </label>
 
-      <div class="depth-box">
-        <input
-          v-model.number="depth"
-          class="depth-input"
-          type="number"
-          min="1"
-          placeholder="Profondità"
-        />
-        <small class="depth-label">Numero di nodi da esplorare</small>
+        <label class="field-group depth-field">
+          <span>Nodi</span>
+          <input v-model.number="depth" class="depth-input" type="number" min="1" />
+        </label>
+
+        <button @click="searchUserReplies" class="search-btn"><span>Esplora</span><span aria-hidden="true">→</span></button>
       </div>
 
-      <button @click="searchUserReplies" class="search-btn">Cerca</button>
-    </div>
+      <div class="view-controls">
+        <span class="view-label">Vista</span>
+        <button @click="toggleCommunityMode" class="view-toggle" :class="{ active: communityMode }" :disabled="!!selectedCategory" title="Colora i nodi secondo le comunità Louvain">
+          <span class="toggle-indicator"></span> Comunità
+        </button>
+        <button @click="toggleBridgeMode" class="view-toggle bridge" :class="{ active: bridgeMode }" :disabled="!communityMode || !!selectedCategory || !communityAnalysis" title="Evidenzia gli utenti che collegano comunità differenti">
+          <span class="toggle-indicator"></span> Nodi ponte
+        </button>
+        <button @click="toggleReciprocalOnly" class="view-toggle reciprocal" :class="{ active: reciprocalOnly }" :disabled="!lastJson?.edges?.length" title="Mostra soltanto le relazioni in entrambe le direzioni">
+          <span class="toggle-indicator"></span> Solo reciproche
+        </button>
+      </div>
+    </section>
 
     <!-- ✅ Banner Chat/Canale migliorato -->
     <div v-if="chatContext" class="chat-banner" :class="{ 'channel-banner': chatContext.is_channel }">
@@ -62,23 +93,74 @@
       <p>{{ channelMessage }}</p>
     </div>
 
-    <div class="graph-layout">
-      <div ref="graphContainer" class="graph-container"></div>
+    <div v-if="selectedCommunity" class="community-filter-banner">
+      <div>
+        <strong>Comunità isolata:</strong> {{ selectedCommunity.label }}
+        <span>
+          {{ stats?.nodes || 0 }} nodi visibili · {{ stats?.edges || 0 }} relazioni visibili
+          <template v-if="selectedCommunity.size"> · {{ selectedCommunity.size }} membri totali</template>
+        </span>
+        <span v-if="selectedCommunity.internal_weight !== undefined">
+          {{ selectedCommunity.internal_weight }} reply interni ·
+          {{ selectedCommunity.external_weight }} reply verso altre comunità
+        </span>
+        <span v-if="selectedCommunity.top_chats?.length" class="community-source-chats">
+          Chat principali: {{ selectedCommunity.top_chats.map(chat => chat.name).join(' · ') }}
+        </span>
+      </div>
+      <button @click="clearCommunityFilter">Mostra tutto</button>
+    </div>
 
-      <div class="legend">
-        <h3>Legenda</h3>
+    <section class="graph-stage">
+      <div class="stage-header">
+        <div>
+          <h2>Mappa delle relazioni</h2>
+          <p>Trascina per muoverti, usa la rotella per ingrandire e fai doppio clic per espandere.</p>
+        </div>
+        <span v-if="stats" class="visible-summary">{{ stats.nodes }} nodi · {{ stats.edges }} archi</span>
+      </div>
+
+      <div class="graph-layout">
+        <div ref="graphContainer" class="graph-container"></div>
+        <div v-if="isGraphLoading" class="graph-loading">
+          <span class="loading-orbit"></span>
+          <strong>Costruzione della rete</strong>
+          <small>Calcolo comunità e relazioni…</small>
+        </div>
+
+      <aside class="legend">
+        <div class="legend-header">
+          <div><span class="eyebrow">Mappa colori</span><h3>Legenda</h3></div>
+          <span v-if="visibleCommunities.length" class="legend-total">{{ visibleCommunities.length }}</span>
+        </div>
         <ul>
-          <li><span class="legend-color" style="background:#2ca02c"></span> Utente</li>
+          <template v-if="communityMode && visibleCommunities.length">
+            <li
+              v-for="community in visibleCommunities"
+              :key="'community-'+community.id"
+              class="community-legend-row"
+              :class="{ selected: selectedCommunityId === community.id }"
+            >
+              <button @click="selectCommunity(community.id)" :title="`Isola ${community.label}`">
+                <span class="legend-color" :style="{ background: communityColor(community.id).background }"></span>
+                <span class="community-label">{{ community.label }}</span>
+                <span class="community-count" title="Nodi visibili">{{ community.count }}</span>
+              </button>
+            </li>
+          </template>
+          <li v-else><span class="legend-color" style="background:#2ca02c"></span> Utente</li>
+          <li v-if="bridgeMode"><span class="legend-bridge"></span> Nodo ponte principale</li>
+          <li v-if="lastJson?.edges?.length"><span class="legend-edge reciprocal"></span> Reply in entrambe le direzioni</li>
+          <li v-if="lastJson?.edges?.length"><span class="legend-edge one-way"></span> Reply a senso unico</li>
           <li><span class="legend-color" style="background:#ff6b6b"></span> Nodo Focus</li>
           <li><span class="legend-color" style="background:#ffd43b"></span> Già esplorato</li>
         </ul>
         <p class="legend-note">
-          <strong>Peso</strong>: numero di reply scambiati (bidirezionale).<br />
-          Più alto è il peso, maggiore l'arco è marcato (blu scuro e più spesso).<br />
-          <strong>Doppio click</strong> su un nodo per espanderlo.
+          Lo spessore indica il numero di reply. Una linea tratteggiata rappresenta una relazione a senso unico.
         </p>
+      </aside>
       </div>
-    </div>
+    </section>
 
     <!-- MODAL DETTAGLIO NODO -->
     <div v-if="selectedNode" class="modal-overlay" @click.self="closeDetails">
@@ -97,6 +179,9 @@
           <p><strong>Nome:</strong> {{ nodeDetails.nome }}</p>
           <p><strong>Ultima attività:</strong> {{ nodeDetails.ultima_attivita }}</p>
           <p><strong>Messaggi totali:</strong> {{ nodeDetails.messaggi_totali }}</p>
+          <p v-if="selectedNode.community"><strong>Comunità:</strong> {{ selectedNode.community_label || 'Gruppo di utenti' }}</p>
+          <p v-if="selectedNode.external_communities"><strong>Comunità collegate:</strong> {{ selectedNode.external_communities }}</p>
+          <p v-if="selectedNode.bridge_score"><strong>Bridge score:</strong> {{ selectedNode.bridge_score.toFixed(2) }}</p>
         </div>
 
         <!-- Riepilogo Interazioni Reply con TENDINE ESPANDIBILI -->
@@ -134,7 +219,13 @@
                         {{ isPublicChat(msg) ? '✈️' : '🔒' }}
                       </a>
                     </div>
-                    <p class="mini-text">{{ truncateText(msg.reply_text || msg.testo, 100) }}</p>
+                    <p class="mini-text">{{ truncateText(msg.testo_tradotto || msg.reply_text || msg.testo, 100) }}</p>
+                    <div class="mini-translation-actions">
+                      <button v-if="!msg.testo_tradotto && !msg.translating" class="btn-translate-mini" @click.stop="translateGraphMessage(msg)">Traduci</button>
+                      <button v-else-if="msg.testo_tradotto" class="btn-translate-mini" @click.stop="msg.testo_tradotto = ''">Nascondi traduzione</button>
+                      <span v-if="msg.translating" class="loading-mini">Traduzione...</span>
+                    </div>
+                    <p v-if="msg.translation_error" class="translation-error">{{ msg.translation_error }}</p>
                   </li>
                   <li v-if="userRepliesCache['sent-'+item.id].length > 3" class="more-messages">
                     ... e altri {{ userRepliesCache['sent-'+item.id].length - 3 }} messaggi
@@ -167,7 +258,13 @@
                         <span class="mini-date">{{ formatDate(msg.data_invio) }}</span>
                         <span class="mini-chat">{{ msg.nome_chat_tradotto || msg.nome_chat }}</span>
                       </div>
-                      <p class="mini-text">{{ truncateText(msg.reply_text || msg.testo, 100) }}</p>
+                      <p class="mini-text">{{ truncateText(msg.testo_tradotto || msg.reply_text || msg.testo, 100) }}</p>
+                      <div class="mini-translation-actions">
+                        <button v-if="!msg.testo_tradotto && !msg.translating" class="btn-translate-mini" @click.stop="translateGraphMessage(msg)">Traduci</button>
+                        <button v-else-if="msg.testo_tradotto" class="btn-translate-mini" @click.stop="msg.testo_tradotto = ''">Nascondi traduzione</button>
+                        <span v-if="msg.translating" class="loading-mini">Traduzione...</span>
+                      </div>
+                      <p v-if="msg.translation_error" class="translation-error">{{ msg.translation_error }}</p>
                     </li>
                   </ul>
                 </div>
@@ -207,7 +304,13 @@
                         {{ isPublicChat(msg) ? '✈️' : '🔒' }}
                       </a>
                     </div>
-                    <p class="mini-text">{{ truncateText(msg.reply_text || msg.testo, 100) }}</p>
+                    <p class="mini-text">{{ truncateText(msg.testo_tradotto || msg.reply_text || msg.testo, 100) }}</p>
+                    <div class="mini-translation-actions">
+                      <button v-if="!msg.testo_tradotto && !msg.translating" class="btn-translate-mini" @click.stop="translateGraphMessage(msg)">Traduci</button>
+                      <button v-else-if="msg.testo_tradotto" class="btn-translate-mini" @click.stop="msg.testo_tradotto = ''">Nascondi traduzione</button>
+                      <span v-if="msg.translating" class="loading-mini">Traduzione...</span>
+                    </div>
+                    <p v-if="msg.translation_error" class="translation-error">{{ msg.translation_error }}</p>
                   </li>
                   <li v-if="userRepliesCache['received-'+item.id].length > 3" class="more-messages">
                     ... e altri {{ userRepliesCache['received-'+item.id].length - 3 }} messaggi
@@ -240,7 +343,13 @@
                         <span class="mini-date">{{ formatDate(msg.data_invio) }}</span>
                         <span class="mini-chat">{{ msg.nome_chat_tradotto || msg.nome_chat }}</span>
                       </div>
-                      <p class="mini-text">{{ truncateText(msg.reply_text || msg.testo, 100) }}</p>
+                      <p class="mini-text">{{ truncateText(msg.testo_tradotto || msg.reply_text || msg.testo, 100) }}</p>
+                      <div class="mini-translation-actions">
+                        <button v-if="!msg.testo_tradotto && !msg.translating" class="btn-translate-mini" @click.stop="translateGraphMessage(msg)">Traduci</button>
+                        <button v-else-if="msg.testo_tradotto" class="btn-translate-mini" @click.stop="msg.testo_tradotto = ''">Nascondi traduzione</button>
+                        <span v-if="msg.translating" class="loading-mini">Traduzione...</span>
+                      </div>
+                      <p v-if="msg.translation_error" class="translation-error">{{ msg.translation_error }}</p>
                     </li>
                   </ul>
                 </div>
@@ -276,6 +385,12 @@
                 </a>
               </p>
               <p>{{ m.testo_tradotto || m.testo }}</p>
+              <div class="mini-translation-actions">
+                <button v-if="!m.testo_tradotto && !m.translating" class="btn-translate-mini" @click.stop="translateGraphMessage(m)">Traduci</button>
+                <button v-else-if="m.testo_tradotto" class="btn-translate-mini" @click.stop="m.testo_tradotto = ''">Nascondi traduzione</button>
+                <span v-if="m.translating" class="loading-mini">Traduzione...</span>
+              </div>
+              <p v-if="m.translation_error" class="translation-error">{{ m.translation_error }}</p>
             </li>
           </ul>
         </div>
@@ -316,6 +431,23 @@
           </div>
         </div>
 
+        <div v-if="edgeDirectionStats" class="edge-quality-card">
+          <div class="edge-quality-heading">
+            <span class="quality-badge" :class="edgeDirectionStats.reciprocal ? 'reciprocal' : 'one-way'">
+              {{ edgeDirectionStats.reciprocal ? '↔ Relazione reciproca' : '→ Relazione a senso unico' }}
+            </span>
+            <strong>{{ Math.round(edgeDirectionStats.reciprocity * 100) }}% equilibrio</strong>
+          </div>
+          <div class="quality-track">
+            <span :style="{ width: `${Math.round(edgeDirectionStats.reciprocity * 100)}%` }"></span>
+          </div>
+          <small>
+            Verificata su {{ edgeDirectionStats.total }} reply con corrispondenza del messaggio originale nella stessa chat.
+          </small>
+        </div>
+
+        <div v-if="edgeMessagesLoading" class="loading-summary">Caricamento delle evidenze…</div>
+
         <div v-if="edgeMessages.length">
           <h4>Ultimi messaggi di reply</h4>
           <ul class="reply-list">
@@ -336,6 +468,12 @@
                 </div>
               </div>
               <p class="msg-text">{{ m.testo_tradotto || m.reply_text || m.testo }}</p>
+              <div class="mini-translation-actions">
+                <button v-if="!m.testo_tradotto && !m.translating" class="btn-translate-mini" @click.stop="translateGraphMessage(m)">Traduci</button>
+                <button v-else-if="m.testo_tradotto" class="btn-translate-mini" @click.stop="m.testo_tradotto = ''">Nascondi traduzione</button>
+                <span v-if="m.translating" class="loading-mini">Traduzione...</span>
+              </div>
+              <p v-if="m.translation_error" class="translation-error">{{ m.translation_error }}</p>
             </li>
           </ul>
         </div>
@@ -352,6 +490,7 @@
 <script>
 import { Network } from "vis-network";
 import { DataSet } from "vis-data";
+import { franc } from "franc-min";
 
 export default {
   name: "Grafo",
@@ -393,10 +532,52 @@ export default {
       loadingUserReplies: null,
       categories: [],        
       selectedCategory: "",
+      communityMode: true,
+      communityAnalysis: null,
+      selectedCommunityId: null,
+      bridgeMode: false,
+      reciprocalOnly: false,
+      isGraphLoading: false,
     };
   },
 
   computed: {
+    visibleCommunities() {
+      if (!this.communityMode || !this.lastJson?.nodes) return [];
+      const communities = new Map();
+      for (const node of this.lastJson.nodes) {
+        if (!node.community) continue;
+        const existing = communities.get(node.community);
+        if (existing) {
+          existing.count += 1;
+        } else {
+          communities.set(node.community, {
+            id: node.community,
+            label: node.community_label || 'Gruppo di utenti',
+            count: 1,
+          });
+        }
+      }
+      return [...communities.values()].sort((a, b) => b.count - a.count).slice(0, 10);
+    },
+    selectedCommunity() {
+      const visible = this.visibleCommunities.find(community => community.id === this.selectedCommunityId);
+      if (!visible) return null;
+      const details = this.communityAnalysis?.communities?.find(
+        community => community.id === this.selectedCommunityId
+      );
+      return { ...(details || {}), ...visible };
+    },
+    relationshipQuality() {
+      const edges = this.lastJson?.edges || [];
+      if (!edges.length) return null;
+      const reciprocal = edges.filter(edge => edge.reciprocal).length;
+      return {
+        reciprocal,
+        total: edges.length,
+        percentage: Math.round((reciprocal / edges.length) * 100),
+      };
+    },
     balanceClass() {
       if (!this.nodeReplySummary) return '';
       const diff = this.nodeReplySummary.totalSent - this.nodeReplySummary.totalReceived;
@@ -424,6 +605,76 @@ export default {
 
   methods: {
     cleanNodeId(nodeId) { return String(nodeId).replace(/^user_/, ""); },
+
+    focusGraphUrl(focusId) {
+      const params = new URLSearchParams({
+        focusId: String(focusId),
+        top: String(this.depth),
+      });
+      if (this.selectedCategory) params.set('category', this.selectedCategory);
+      return `http://127.0.0.1:5000/api/graph/focus?${params.toString()}`;
+    },
+
+    communityColor(communityId) {
+      const hue = (Number(communityId) * 137.508) % 360;
+      return {
+        background: `hsl(${hue}, 68%, 58%)`,
+        border: `hsl(${hue}, 72%, 35%)`,
+        highlight: { background: `hsl(${hue}, 75%, 68%)`, border: `hsl(${hue}, 72%, 30%)` },
+        hover: { background: `hsl(${hue}, 75%, 64%)`, border: `hsl(${hue}, 72%, 32%)` },
+      };
+    },
+
+    toggleCommunityMode() {
+      this.communityMode = !this.communityMode;
+      this.selectedCommunityId = null;
+      if (!this.communityMode) this.bridgeMode = false;
+      this.loadGraph(50);
+    },
+
+    async toggleBridgeMode() {
+      this.bridgeMode = !this.bridgeMode;
+      await this.renderCurrentGraph();
+    },
+
+    async toggleReciprocalOnly() {
+      this.reciprocalOnly = !this.reciprocalOnly;
+      await this.renderCurrentGraph();
+    },
+
+    async selectCommunity(communityId) {
+      this.selectedCommunityId = this.selectedCommunityId === communityId ? null : communityId;
+      await this.renderCurrentGraph();
+    },
+
+    async clearCommunityFilter() {
+      this.selectedCommunityId = null;
+      await this.renderCurrentGraph();
+    },
+
+    async renderCurrentGraph() {
+      if (!this.lastJson) return;
+      let nodes = this.lastJson.nodes || [];
+      let edges = this.lastJson.edges || [];
+
+      if (this.selectedCommunityId) {
+        nodes = nodes.filter(node => node.community === this.selectedCommunityId);
+        const visibleNodeIds = new Set(nodes.map(node => node.id));
+        edges = edges.filter(edge => visibleNodeIds.has(edge.from) && visibleNodeIds.has(edge.to));
+      }
+
+      if (this.reciprocalOnly) {
+        edges = edges.filter(edge => edge.reciprocal);
+        const connectedNodeIds = new Set(edges.flatMap(edge => [edge.from, edge.to]));
+        nodes = nodes.filter(node => connectedNodeIds.has(node.id));
+      }
+
+      const processed = await this.processGraphData(nodes, edges);
+      this.nodesDS = new DataSet(processed.nodes);
+      this.edgesDS = new DataSet(processed.edges);
+      this.stats = { nodes: processed.nodes.length, edges: processed.edges.length };
+      this.renderNetwork(this.nodesDS, this.edgesDS);
+    },
     
     getNodeExploredDepth(nodeId) {
       return this.exploredNodesDepth[this.cleanNodeId(nodeId)] || 0;
@@ -520,13 +771,25 @@ export default {
       }
     },
 
-    async translateText(text) {
-      if (!text) return "";
+    async translateGraphMessage(message) {
+      const text = message?.reply_text || message?.testo || "";
+      if (!text) return;
+      message.translating = true;
+      message.translation_error = "";
       try {
-        const res = await fetch("http://127.0.0.1:5000/api/traduci", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ q: text }) });
+        const res = await fetch("http://127.0.0.1:5000/api/traduci", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ q: text, source: franc(text) }),
+        });
         const data = await res.json();
-        return data.translatedText || text;
-      } catch { return text; }
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        message.testo_tradotto = data.translatedText;
+      } catch (error) {
+        message.translation_error = error.message || "Traduzione non disponibile";
+      } finally {
+        message.translating = false;
+      }
     },
 
     async fetchNodeDetails(node) {
@@ -538,14 +801,19 @@ export default {
       try {
         if (node.id.startsWith("user_")) {
           const id = this.cleanNodeId(node.id);
-          const res = await fetch(`http://127.0.0.1:5000/api/utente/${id}`);
+          const [res, mres, summaryRes] = await Promise.all([
+            fetch(`http://127.0.0.1:5000/api/utente/${id}`),
+            fetch(`http://127.0.0.1:5000/api/messaggi_utente/${id}?limit=3&offset=0`),
+            fetch(`http://127.0.0.1:5000/api/reply_summary/${id}`),
+          ]);
           if (res.ok) { const data = await res.json(); this.nodeDetails = data.user || null; this.userChats = data.chats || []; }
-          const mres = await fetch(`http://127.0.0.1:5000/api/messaggi_utente/${id}`);
           if (mres.ok) {
             const data = await mres.json();
-            this.userMessages = await Promise.all((data.data || []).slice(0, 3).map(async m => { m.testo_tradotto = await this.translateText(m.testo); return m; }));
+            this.userMessages = (data.data || []).slice(0, 3);
           }
-          await this.fetchNodeReplySummary(id);
+          if (summaryRes.ok) {
+            this.nodeReplySummary = await summaryRes.json();
+          }
         }
       } catch (err) { console.error("Errore fetch dettagli nodo:", err); this.nodeDetails = { errore: "Impossibile caricare" }; }
       finally { this.nodeReplySummaryLoading = false; }
@@ -553,43 +821,9 @@ export default {
 
     async fetchNodeReplySummary(userId) {
       try {
-        const resSent = await fetch(`http://127.0.0.1:5000/api/reply_utente/${userId}`);
-        let sentReplies = [];
-        if (resSent.ok) { const payload = await resSent.json(); sentReplies = Array.isArray(payload) ? payload : (payload.data || []); }
-        const sentMap = new Map();
-        for (const r of sentReplies) {
-          const destId = String(r.reply_to_user_id);
-          if (!destId || destId === 'null') continue;
-          const nome = r.reply_to_nome?.trim() || (r.reply_to_username ? '@' + r.reply_to_username : '') || `Utente ${destId}`;
-          if (!sentMap.has(destId)) sentMap.set(destId, { id: destId, nome, count: 0 });
-          sentMap.get(destId).count++;
-        }
-        const receivedMap = new Map();
-        const connectedNodeIds = this.getConnectedNodeIds(`user_${userId}`);
-        for (const neighborId of connectedNodeIds) {
-          const neighborCleanId = this.cleanNodeId(neighborId);
-          if (neighborCleanId === userId) continue;
-          try {
-            const resNeighbor = await fetch(`http://127.0.0.1:5000/api/reply_utente/${neighborCleanId}`);
-            if (resNeighbor.ok) {
-              const payload = await resNeighbor.json();
-              const neighborReplies = Array.isArray(payload) ? payload : (payload.data || []);
-              const repliesToUser = neighborReplies.filter(r => String(r.reply_to_user_id) === userId);
-              if (repliesToUser.length > 0) {
-                const first = repliesToUser[0];
-                const nome = first.autore_nome?.trim() || (first.autore_username ? '@' + first.autore_username : '') || `Utente ${neighborCleanId}`;
-                receivedMap.set(neighborCleanId, { id: neighborCleanId, nome, count: repliesToUser.length });
-              }
-            }
-          } catch (e) { console.warn(`Errore fetch reply da ${neighborCleanId}:`, e); }
-        }
-        const sentList = Array.from(sentMap.values()).sort((a, b) => b.count - a.count);
-        const receivedList = Array.from(receivedMap.values()).sort((a, b) => b.count - a.count);
-        this.nodeReplySummary = {
-          sent: sentList, received: receivedList,
-          totalSent: sentList.reduce((sum, x) => sum + x.count, 0),
-          totalReceived: receivedList.reduce((sum, x) => sum + x.count, 0)
-        };
+        const res = await fetch(`http://127.0.0.1:5000/api/reply_summary/${userId}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        this.nodeReplySummary = await res.json();
       } catch (err) { console.error("Errore fetch reply summary:", err); this.nodeReplySummary = null; }
     },
     async fetchCategories() {
@@ -610,36 +844,55 @@ reloadGraph() {
 
     async fetchEdgeDetails(edge) {
       this.edgeMessages = [];
-      this.edgeDirectionStats = null;
+      this.edgeDirectionStats = edge?.forward !== undefined
+        ? {
+            aToB: Number(edge.forward || 0),
+            bToA: Number(edge.reverse || 0),
+            total: Number(edge.value || 0),
+            reciprocal: Boolean(edge.reciprocal),
+            reciprocity: Number(edge.reciprocity || 0),
+          }
+        : null;
       this.edgeMessagesLoading = true;
       try {
         if (!edge?.from || !edge?.to) return;
         const fromId = this.cleanNodeId(edge.from);
         const toId = this.cleanNodeId(edge.to);
-        let messagesAtoB = [], messagesBtoA = [];
-        try {
-          const res1 = await fetch(`http://127.0.0.1:5000/api/reply_utente/${fromId}`);
-          if (res1.ok) { const payload = await res1.json(); const rows = Array.isArray(payload) ? payload : (payload.data || []); messagesAtoB = rows.filter(r => String(r.reply_to_user_id) === toId); }
-        } catch (e) { console.warn("Errore fetch reply A→B:", e); }
-        try {
-          const res2 = await fetch(`http://127.0.0.1:5000/api/reply_utente/${toId}`);
-          if (res2.ok) { const payload = await res2.json(); const rows = Array.isArray(payload) ? payload : (payload.data || []); messagesBtoA = rows.filter(r => String(r.reply_to_user_id) === fromId); }
-        } catch (e) { console.warn("Errore fetch reply B→A:", e); }
-        this.edgeDirectionStats = { aToB: messagesAtoB.length, bToA: messagesBtoA.length, total: messagesAtoB.length + messagesBtoA.length };
-        const allMessages = [...messagesAtoB, ...messagesBtoA].sort((a, b) => new Date(b.data_invio) - new Date(a.data_invio));
-        this.edgeMessages = await Promise.all(allMessages.slice(0, 5).map(async m => { m.testo_tradotto = await this.translateText(m.reply_text || m.testo); return m; }));
-        const updatedEdge = { ...edge, value: this.edgeDirectionStats.total };
-        try { const resFrom = await fetch(`http://127.0.0.1:5000/api/utente/${fromId}`); if (resFrom.ok) { const d = await resFrom.json(); if (d.user) { updatedEdge.fromNome = d.user.nome; updatedEdge.fromUser = d.user.username; } } } catch {}
-        try { const resTo = await fetch(`http://127.0.0.1:5000/api/utente/${toId}`); if (resTo.ok) { const d = await resTo.json(); if (d.user) { updatedEdge.toNome = d.user.nome; updatedEdge.toUser = d.user.username; } } } catch {}
-        this.selectedEdge = updatedEdge;
+        const res = await fetch(`http://127.0.0.1:5000/api/graph/edge/${fromId}/${toId}`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.message || `HTTP ${res.status}`);
+
+        this.edgeDirectionStats = {
+          aToB: Number(data.stats?.forward || 0),
+          bToA: Number(data.stats?.reverse || 0),
+          total: Number(data.stats?.total || 0),
+          reciprocal: Boolean(data.stats?.reciprocal),
+          reciprocity: Number(data.stats?.reciprocity || 0),
+        };
+        this.edgeMessages = data.messages || [];
+        this.selectedEdge = {
+          ...edge,
+          value: this.edgeDirectionStats.total,
+          fromNome: data.from_user?.nome,
+          fromUser: data.from_user?.username,
+          avatar_from: data.from_user?.avatar_url,
+          toNome: data.to_user?.nome,
+          toUser: data.to_user?.username,
+          avatar_to: data.to_user?.avatar_url,
+        };
       } catch (err) { console.error("Errore fetch arco:", err); }
       finally { this.edgeMessagesLoading = false; }
     },
 
     async loadGraph(limit = 300) {
+  this.isGraphLoading = true;
   try {
     // 1. Costruisci l'URL base con il limite
     let url = `http://127.0.0.1:5000/api/graph?limit=${limit}`;
+
+    if (this.communityMode && !this.selectedCategory) {
+      url += "&communities=1";
+    }
 
     // 2. Aggiungi il parametro category se selezionato
     if (this.selectedCategory) {
@@ -652,19 +905,19 @@ reloadGraph() {
     
     const json = await res.json();
     this.lastJson = json;
+    this.selectedCommunityId = null;
     this.exploredNodesDepth = {};
     this.initialFocusId = null;
     this.chatContext = null;
     this.channelMessage = null;
-    this.stats = { nodes: (json.nodes || []).length, edges: (json.edges || []).length };
-    
-    const processed = await this.processGraphData(json.nodes || [], json.edges || []);
-    this.nodesDS = new DataSet(processed.nodes);
-    this.edgesDS = new DataSet(processed.edges);
-    this.renderNetwork(this.nodesDS, this.edgesDS);
+    this.communityAnalysis = json.community_analysis || null;
+    if (!this.communityAnalysis) this.bridgeMode = false;
+    await this.renderCurrentGraph();
   } catch (err) { 
     console.error("Errore caricamento grafo:", err); 
     this.showToast("Errore nel caricamento del grafo"); 
+  } finally {
+    this.isGraphLoading = false;
   }
 },
 
@@ -679,22 +932,61 @@ reloadGraph() {
       const weights = edges.map(e => Number(e.value ?? e.peso ?? 1)).filter(n => !isNaN(n));
       const wMin = weights.length ? Math.min(...weights) : 1;
       const wMax = weights.length ? Math.max(...weights) : 1;
+      const bridgeNodeIds = new Set(
+        this.bridgeMode
+          ? [...nodes]
+              .filter(node => Number(node.bridge_score) > 0)
+              .sort((a, b) => Number(b.bridge_score) - Number(a.bridge_score))
+              .slice(0, 12)
+              .map(node => node.id)
+          : []
+      );
       const seen = new Set();
       const processedNodes = (nodes || []).map(n => {
         if (seen.has(n.id)) return null;
         seen.add(n.id);
         const cleanId = this.cleanNodeId(n.id);
         const safeLabel = n.label && n.label.trim() !== "" ? n.label : String(n.id);
+        const displayLabel = /^\d{9,}$/.test(safeLabel) ? `…${safeLabel.slice(-6)}` : safeLabel;
         const exploredDepth = this.exploredNodesDepth[cleanId] || 0;
         const isFocus = focusId && cleanId === String(focusId);
-        let nodeColor = n.color || this.getNodeColor(n.id, isFocus);
+        const isBridge = bridgeNodeIds.has(n.id);
+        let nodeColor = n.color || (
+          this.communityMode && n.community
+            ? this.communityColor(n.community)
+            : this.getNodeColor(n.id, isFocus)
+        );
+        if (isFocus) nodeColor = this.getNodeColor(n.id, true);
         if (exploredDepth > 0 && !isFocus) nodeColor = this.getNodeColor(n.id, false);
+        if (isBridge && !isFocus && exploredDepth === 0) {
+          nodeColor = {
+            ...nodeColor,
+            border: '#f08c00',
+            highlight: { ...(nodeColor.highlight || {}), border: '#e67700' },
+            hover: { ...(nodeColor.hover || {}), border: '#e67700' },
+          };
+        }
         
         let title = safeLabel;
         if (isFocus) title += " (focus)";
         else if (exploredDepth > 0) title += ` (esplorato: ${exploredDepth})`;
+        if (n.community) title += `\n${n.community_label || 'Gruppo di utenti'}`;
+        if (n.external_communities) title += `\nCollega ${n.external_communities} comunità`;
+        if (isBridge) title += `\nNodo ponte principale · score ${Number(n.bridge_score).toFixed(2)}`;
         
-        return { ...n, label: safeLabel, font: { color: "#000" }, shape: "dot", scaling: { min: 10, max: 45 }, title, color: nodeColor };
+        return {
+          ...n,
+          label: displayLabel,
+          font: { color: "#000" },
+          shape: isBridge ? "diamond" : "dot",
+          borderWidth: isBridge ? 4 : 1.5,
+          shadow: isBridge ? { enabled: true, color: 'rgba(240, 140, 0, 0.35)', size: 12 } : false,
+          is_bridge: isBridge,
+          value: n.weighted_degree ? Math.log1p(n.weighted_degree) : n.value,
+          scaling: { min: 10, max: 45 },
+          title,
+          color: nodeColor,
+        };
       }).filter(Boolean);
       const nodeMap = {};
       processedNodes.forEach(n => (nodeMap[n.id] = true));
@@ -705,7 +997,28 @@ reloadGraph() {
         if (seenEdges.has(normalizedId)) return null;
         seenEdges.add(normalizedId);
         const color = this.blueByWeight(value, wMin, wMax);
-        return { ...e, id: normalizedId, value, width: Math.max(1, Math.log2(value + 1)), color: { color, highlight: color, hover: color }, label: value ? `${value}` : "", font: { size: 9, align: "horizontal" }, smooth: { type: "dynamic" }, arrows: { to: { enabled: false } } };
+        const reciprocal = Boolean(e.reciprocal);
+        const forward = Number(e.forward || 0);
+        const reverse = Number(e.reverse || 0);
+        return {
+          ...e,
+          id: normalizedId,
+          value,
+          reciprocal,
+          width: Math.max(1, Math.log2(value + 1)),
+          color: { color, highlight: '#1d4ed8', hover: '#2563eb', opacity: reciprocal ? 0.82 : 0.58 },
+          label: value ? `${reciprocal ? '↔ ' : ''}${value}` : "",
+          title: reciprocal
+            ? `${forward} reply →\n${reverse} reply ←\nReciprocità ${Math.round(Number(e.reciprocity || 0) * 100)}%`
+            : `${value} reply in una sola direzione`,
+          dashes: reciprocal ? false : [8, 7],
+          font: { size: 10, color: '#475569', strokeWidth: 4, strokeColor: '#ffffff', align: "horizontal" },
+          smooth: { type: "dynamic" },
+          arrows: {
+            to: { enabled: !reciprocal && forward > 0, scaleFactor: 0.55 },
+            from: { enabled: !reciprocal && reverse > 0, scaleFactor: 0.55 },
+          },
+        };
       }).filter(e => e && nodeMap[e.from] && nodeMap[e.to]);
       return { nodes: processedNodes, edges: processedEdges };
     },
@@ -751,9 +1064,14 @@ reloadGraph() {
       // Reset stato
       this.channelMessage = null;
       this.chatContext = null;
+      this.lastJson = null;
+      this.communityAnalysis = null;
+      this.selectedCommunityId = null;
+      this.bridgeMode = false;
+      this.reciprocalOnly = false;
       
       try {
-        const res = await fetch(`http://127.0.0.1:5000/api/graph/focus?focusId=${encodeURIComponent(q)}&top=${this.depth}`);
+        const res = await fetch(this.focusGraphUrl(q));
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const json = await res.json();
         
@@ -839,7 +1157,7 @@ reloadGraph() {
       }
       
       try {
-        const res = await fetch(`http://127.0.0.1:5000/api/graph/focus?focusId=${encodeURIComponent(focusClean)}&top=${this.depth}`);
+        const res = await fetch(this.focusGraphUrl(focusClean));
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const json = await res.json();
 
@@ -924,24 +1242,88 @@ reloadGraph() {
 </script>
 
 <style scoped>
-.graph-page { padding: 1.5rem; }
-.page-title { font-size: 1.8rem; font-weight: 700; margin-bottom: 0.3rem; color: #1d3b70; }
-.page-description { font-size: 1rem; color: #444; margin-bottom: 1rem; }
-.stats-box { display: flex; gap: 1.2rem; margin-bottom: 1rem; }
-.stat-item { background: #fff; padding: 0.6rem 1rem; border-radius: 6px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); font-size: 0.95rem; }
-.search-bar { display: flex; gap: 0.6rem; margin-bottom: 1rem; flex-wrap: wrap; }
-.search-input { flex: 2; min-width: 200px; padding: 0.6rem 0.8rem; border: 1px solid #ccc; border-radius: 6px; font-size: 1rem; }
-.depth-input { width: 80px; padding: 0.4rem; border: 1px solid #ccc; border-radius: 6px; text-align: center; font-size: 1rem; }
-.search-btn { background: #3558ff; color: #fff; border: none; padding: 0.6rem 1rem; border-radius: 6px; cursor: pointer; font-weight: 600; }
-.search-btn:hover { background: #2f4dd7; }
-.graph-layout { display: flex; gap: 1rem; }
-.graph-container { flex: 4; height: 70vh; border-radius: 8px; background: #fff; box-shadow: 0 2px 6px rgba(0,0,0,0.08); }
-.legend { flex: 1; background: #f9fbff; padding: 1rem; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); height: fit-content; min-width: 180px; }
-.legend h3 { margin-bottom: 0.8rem; font-size: 1.1rem; }
-.legend ul { list-style: none; padding: 0; margin: 0 0 0.8rem 0; }
-.legend li { display: flex; align-items: center; margin-bottom: 0.4rem; }
-.legend-color { display: inline-block; width: 16px; height: 16px; margin-right: 6px; border-radius: 4px; }
-.legend-note { font-size: 0.85rem; color: #555; line-height: 1.4; }
+.graph-page { max-width: 1800px; margin: 0 auto; padding: 2rem clamp(1rem, 2.4vw, 2.5rem) 3rem; }
+.graph-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 2rem; margin-bottom: 1.4rem; }
+.eyebrow { display: block; margin-bottom: 0.35rem; color: #4f46e5; font-size: 0.68rem; font-weight: 800; letter-spacing: 0.14em; text-transform: uppercase; }
+.page-title { margin: 0 0 0.35rem; color: #0f172a; font-size: clamp(2rem, 3vw, 2.65rem); line-height: 1.08; letter-spacing: -0.04em; }
+.page-description { max-width: 760px; margin: 0; color: #64748b; font-size: 0.98rem; }
+.graph-health { display: inline-flex; align-items: center; gap: 0.55rem; flex: 0 0 auto; margin-top: 0.35rem; padding: 0.48rem 0.75rem; border: 1px solid #d1fae5; border-radius: 999px; background: #ecfdf5; color: #047857; font-size: 0.76rem; font-weight: 700; }
+.graph-health.loading { border-color: #dbeafe; background: #eff6ff; color: #1d4ed8; }
+.health-dot { width: 7px; height: 7px; border-radius: 50%; background: #10b981; box-shadow: 0 0 0 4px rgba(16,185,129,0.12); }
+.graph-health.loading .health-dot { background: #3b82f6; box-shadow: 0 0 0 4px rgba(59,130,246,0.12); animation: pulse 1.1s ease-in-out infinite; }
+
+.stats-box { display: grid; grid-template-columns: repeat(5, minmax(145px, 1fr)); gap: 0.75rem; margin-bottom: 1rem; }
+.stat-item { display: flex; align-items: center; gap: 0.75rem; min-height: 72px; padding: 0.8rem 0.95rem; border: 1px solid #e2e8f0; border-radius: 13px; background: #fff; box-shadow: 0 1px 2px rgba(15,23,42,0.03); }
+.stat-item > div { display: flex; flex-direction: column; min-width: 0; }
+.stat-item small { color: #64748b; font-size: 0.7rem; font-weight: 650; letter-spacing: 0.02em; white-space: nowrap; }
+.stat-item strong { color: #0f172a; font-size: 1.3rem; line-height: 1.2; letter-spacing: -0.03em; }
+.stat-icon { display: grid; place-items: center; flex: 0 0 34px; width: 34px; height: 34px; border-radius: 10px; font-size: 1rem; font-weight: 800; }
+.stat-icon.nodes { background: #eef2ff; color: #4f46e5; }
+.stat-icon.edges { background: #eff6ff; color: #2563eb; }
+.stat-icon.communities { background: #f5f3ff; color: #7c3aed; }
+.stat-icon.largest { background: #fff7ed; color: #ea580c; }
+.stat-icon.quality { background: #ecfdf5; color: #059669; }
+
+.graph-toolbar { margin-bottom: 1rem; overflow: hidden; border: 1px solid #dfe6ef; border-radius: 15px; background: rgba(255,255,255,0.96); box-shadow: 0 4px 18px rgba(15,23,42,0.045); }
+.toolbar-search { display: grid; grid-template-columns: minmax(170px, 0.72fr) minmax(300px, 2fr) 82px auto; align-items: end; gap: 0.75rem; padding: 0.9rem; }
+.field-group { display: flex; flex-direction: column; gap: 0.35rem; min-width: 0; }
+.field-group > span { color: #64748b; font-size: 0.68rem; font-weight: 750; letter-spacing: 0.045em; text-transform: uppercase; }
+.category-select, .search-input, .depth-input { width: 100%; height: 42px; border: 1px solid #dbe3ed; border-radius: 9px; outline: 0; background: #f8fafc; color: #1e293b; font: inherit; font-size: 0.88rem; transition: border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease; }
+.category-select { max-width: none; padding: 0 0.75rem; cursor: pointer; }
+.search-input { min-width: 0; padding: 0 0.8rem 0 2.45rem; }
+.depth-input { padding: 0 0.5rem; text-align: center; }
+.category-select:focus, .search-input:focus, .depth-input:focus { border-color: #818cf8; background: #fff; box-shadow: 0 0 0 3px rgba(99,102,241,0.12); }
+.search-input-wrap { position: relative; }
+.search-icon { position: absolute; top: 50%; left: 0.85rem; z-index: 1; transform: translateY(-50%); color: #94a3b8; font-size: 1.15rem; pointer-events: none; }
+.search-btn { display: inline-flex; align-items: center; justify-content: center; gap: 0.7rem; height: 42px; padding: 0 1.1rem; border: 0; border-radius: 9px; background: linear-gradient(135deg, #4f46e5, #2563eb); color: #fff; cursor: pointer; font-weight: 750; box-shadow: 0 5px 12px rgba(79,70,229,0.2); transition: transform 0.18s ease, box-shadow 0.18s ease; }
+.search-btn:hover { transform: translateY(-1px); box-shadow: 0 8px 16px rgba(79,70,229,0.25); }
+.view-controls { display: flex; align-items: center; gap: 0.45rem; min-height: 52px; padding: 0.6rem 0.9rem; border-top: 1px solid #edf1f6; background: #fbfcfe; }
+.view-label { margin-right: 0.3rem; color: #94a3b8; font-size: 0.68rem; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; }
+.view-toggle { display: inline-flex; align-items: center; gap: 0.45rem; padding: 0.42rem 0.7rem; border: 1px solid transparent; border-radius: 999px; background: transparent; color: #64748b; cursor: pointer; font-size: 0.78rem; font-weight: 700; transition: all 0.18s ease; }
+.view-toggle:hover:not(:disabled) { border-color: #dbe3ed; background: #fff; color: #334155; }
+.view-toggle.active { border-color: #c7d2fe; background: #eef2ff; color: #4338ca; }
+.view-toggle.bridge.active { border-color: #fed7aa; background: #fff7ed; color: #c2410c; }
+.view-toggle.reciprocal.active { border-color: #a7f3d0; background: #ecfdf5; color: #047857; }
+.view-toggle:disabled { opacity: 0.42; cursor: not-allowed; }
+.toggle-indicator { width: 7px; height: 7px; border-radius: 50%; background: #cbd5e1; }
+.view-toggle.active .toggle-indicator { background: currentColor; box-shadow: 0 0 0 3px rgba(99,102,241,0.1); }
+
+.community-filter-banner { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin: 0 0 1rem; padding: 0.85rem 1rem; border: 1px solid #ddd6fe; border-radius: 12px; background: linear-gradient(135deg, #faf5ff, #eef2ff); color: #3730a3; }
+.community-filter-banner span { display: block; margin-top: 0.16rem; color: #6d5f91; font-size: 0.8rem; }
+.community-filter-banner .community-source-chats { max-width: 900px; color: #514373; font-style: italic; }
+.community-filter-banner button { flex: 0 0 auto; border: 1px solid #c4b5fd; border-radius: 8px; background: rgba(255,255,255,0.8); color: #5b21b6; padding: 0.48rem 0.75rem; cursor: pointer; font-weight: 750; }
+
+.graph-stage { overflow: hidden; border: 1px solid #dfe6ef; border-radius: 16px; background: #fff; box-shadow: 0 12px 35px rgba(15,23,42,0.07); }
+.stage-header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; min-height: 68px; padding: 0.8rem 1.1rem; border-bottom: 1px solid #edf1f6; }
+.stage-header h2 { margin: 0 0 0.15rem; color: #172033; font-size: 1rem; letter-spacing: -0.01em; }
+.stage-header p { margin: 0; color: #8491a3; font-size: 0.75rem; }
+.visible-summary { flex: 0 0 auto; padding: 0.35rem 0.62rem; border-radius: 999px; background: #f1f5f9; color: #64748b; font-size: 0.72rem; font-weight: 750; }
+.graph-layout { position: relative; min-height: 610px; }
+.graph-container { width: 100%; height: 70vh; min-height: 610px; background-color: #fbfdff; background-image: radial-gradient(circle at 15% 20%, rgba(99,102,241,0.055), transparent 28%), radial-gradient(circle at 82% 72%, rgba(14,165,233,0.045), transparent 30%), linear-gradient(rgba(226,232,240,0.38) 1px, transparent 1px), linear-gradient(90deg, rgba(226,232,240,0.38) 1px, transparent 1px); background-size: auto, auto, 28px 28px, 28px 28px; }
+.graph-loading { position: absolute; inset: 0; z-index: 5; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 0.35rem; background: rgba(248,250,252,0.88); backdrop-filter: blur(3px); color: #334155; }
+.graph-loading small { color: #94a3b8; }
+.loading-orbit { width: 32px; height: 32px; margin-bottom: 0.4rem; border: 3px solid #dbeafe; border-top-color: #4f46e5; border-radius: 50%; animation: spin 0.8s linear infinite; }
+.legend { position: absolute; top: 1rem; right: 1rem; z-index: 4; width: min(300px, calc(100% - 2rem)); max-height: calc(70vh - 2rem); overflow-y: auto; padding: 0.9rem; border: 1px solid rgba(203,213,225,0.85); border-radius: 13px; background: rgba(255,255,255,0.91); box-shadow: 0 10px 30px rgba(15,23,42,0.1); backdrop-filter: blur(12px); }
+.legend-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 0.55rem; }
+.legend-header .eyebrow { margin-bottom: 0.05rem; font-size: 0.58rem; }
+.legend h3 { margin: 0; color: #1e293b; font-size: 0.98rem; }
+.legend-total { display: grid; place-items: center; min-width: 25px; height: 25px; padding: 0 0.35rem; border-radius: 8px; background: #eef2ff; color: #4f46e5; font-size: 0.72rem; font-weight: 800; }
+.legend ul { list-style: none; padding: 0; margin: 0 0 0.65rem; }
+.legend li { display: flex; align-items: flex-start; margin-bottom: 0.28rem; color: #475569; font-size: 0.78rem; line-height: 1.3; }
+.legend-color { display: inline-block; flex: 0 0 12px; width: 12px; height: 12px; margin: 2px 7px 0 0; border-radius: 4px; box-shadow: inset 0 0 0 1px rgba(15,23,42,0.08); }
+.community-label { display: -webkit-box; overflow: hidden; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.community-legend-row { border-radius: 7px; transition: background 0.15s ease; }
+.community-legend-row:hover, .community-legend-row.selected { background: #eef2ff; }
+.community-legend-row button { display: flex; align-items: flex-start; width: 100%; border: 0; padding: 0.38rem 0.4rem; background: transparent; color: inherit; text-align: left; cursor: pointer; font: inherit; }
+.community-count { flex: 0 0 auto; min-width: 23px; margin-left: auto; padding: 0.08rem 0.33rem; border-radius: 999px; background: #f1f5f9; color: #64748b; font-size: 0.65rem; font-weight: 800; text-align: center; }
+.legend-bridge { display: inline-block; flex: 0 0 11px; width: 11px; height: 11px; margin: 2px 8px 0 2px; border: 2px solid #f08c00; background: #fff4e6; transform: rotate(45deg); }
+.legend-edge { display: inline-block; flex: 0 0 18px; width: 18px; height: 0; margin: 7px 7px 0 0; border-top: 2px solid #3b82f6; }
+.legend-edge.one-way { border-top-style: dashed; opacity: 0.65; }
+.legend-note { margin: 0; padding-top: 0.65rem; border-top: 1px solid #edf1f6; color: #7b8798; font-size: 0.7rem; line-height: 1.45; }
+
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes pulse { 50% { opacity: 0.45; } }
+@keyframes drawer-in { from { opacity: 0; transform: translateX(28px); } to { opacity: 1; transform: translateX(0); } }
 
 /* ✅ Banner Chat migliorato */
 .chat-banner { 
@@ -990,14 +1372,14 @@ reloadGraph() {
   line-height: 1.5;
 }
 
-.modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.45); display: flex; align-items: center; justify-content: center; z-index: 2000; }
-.modal { background: #fff; padding: 1.2rem 1.5rem; border-radius: 8px; width: 520px; max-width: 95%; max-height: 85vh; overflow-y: auto; box-shadow: 0 4px 12px rgba(0,0,0,0.25); }
-.modal h3 { margin-bottom: 0.8rem; display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; }
+.modal-overlay { position: fixed; inset: 0; z-index: 2000; display: flex; align-items: stretch; justify-content: flex-end; background: rgba(15,23,42,0.32); backdrop-filter: blur(3px); }
+.modal { width: min(620px, 96vw); max-width: none; max-height: 100vh; overflow-y: auto; padding: 1.6rem 1.75rem 2rem; border-left: 1px solid #e2e8f0; border-radius: 18px 0 0 18px; background: #fff; box-shadow: -18px 0 50px rgba(15,23,42,0.16); animation: drawer-in 0.22s ease-out; }
+.modal h3 { margin-bottom: 1rem; padding-bottom: 0.85rem; border-bottom: 1px solid #edf1f6; display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; color: #172033; }
 .modal h4 { margin-top: 1rem; margin-bottom: 0.5rem; font-size: 1rem; color: #1d3b70; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
-.btn-close { margin-top: 1rem; padding: 0.5rem 1rem; border: none; border-radius: 6px; background: #e63946; color: #fff; cursor: pointer; font-weight: 600; width: 100%; }
-.btn-close:hover { background: #c92c3c; }
-.toast { position: fixed; bottom: 1.5rem; right: 1.5rem; background: #333; color: #fff; padding: 0.7rem 1.2rem; border-radius: 6px; font-size: 0.9rem; z-index: 3000; }
+.btn-close { margin-top: 1rem; padding: 0.65rem 1rem; border: 1px solid #dbe3ed; border-radius: 9px; background: #f8fafc; color: #334155; cursor: pointer; font-weight: 700; width: 100%; }
+.btn-close:hover { border-color: #cbd5e1; background: #f1f5f9; }
+.toast { position: fixed; bottom: 1.5rem; right: 1.5rem; background: #172033; color: #fff; padding: 0.72rem 1rem; border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; box-shadow: 0 12px 30px rgba(15,23,42,0.25); font-size: 0.85rem; z-index: 3000; }
 .username-link { color: #3558ff; text-decoration: none; font-weight: 600; display: inline-block; margin-top: 0.8rem; }
 .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.75rem; color: #fff; font-weight: 600; }
 .badge.Utente { background: #2ca02c; }
@@ -1052,6 +1434,15 @@ reloadGraph() {
 .direction-count { padding: 0.1rem 0.4rem; border-radius: 4px; font-weight: 600; }
 .direction-count.out { background: #fff5f5; color: #e63946; }
 .direction-count.in { background: #f0fff4; color: #2ca02c; }
+.edge-quality-card { margin-bottom: 1rem; padding: 0.85rem; border: 1px solid #e2e8f0; border-radius: 11px; background: #f8fafc; }
+.edge-quality-heading { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; margin-bottom: 0.6rem; }
+.edge-quality-heading strong { color: #334155; font-size: 0.78rem; }
+.quality-badge { display: inline-flex; align-items: center; padding: 0.25rem 0.55rem; border-radius: 999px; font-size: 0.7rem; font-weight: 800; }
+.quality-badge.reciprocal { border: 1px solid #a7f3d0; background: #ecfdf5; color: #047857; }
+.quality-badge.one-way { border: 1px solid #fed7aa; background: #fff7ed; color: #c2410c; }
+.quality-track { height: 6px; margin-bottom: 0.5rem; overflow: hidden; border-radius: 999px; background: #e2e8f0; }
+.quality-track span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #60a5fa, #10b981); transition: width 0.25s ease; }
+.edge-quality-card small { display: block; color: #64748b; font-size: 0.7rem; line-height: 1.4; }
 
 /* TELEGRAM LINK */
 .tg-link { display: inline-flex; align-items: center; gap: 0.2rem; font-size: 0.75rem; font-weight: 600; color: #0088cc; background-color: #e3f2fd; padding: 0.1rem 0.4rem; border-radius: 4px; text-decoration: none; margin-left: 4px; }
@@ -1071,6 +1462,10 @@ reloadGraph() {
 .mini-date { color: #666; font-style: italic; }
 .mini-chat { color: #1d3b70; font-weight: 500; }
 .mini-text { margin: 4px 0 0 0; font-size: 0.8rem; color: #444; line-height: 1.4; background: #f8f9fa; padding: 4px 8px; border-radius: 4px; border-left: 2px solid #3558ff; }
+.mini-translation-actions { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.35rem; }
+.btn-translate-mini { border: 1px solid #9bb7ff; background: #eef4ff; color: #244ea2; border-radius: 5px; padding: 0.25rem 0.55rem; font-size: 0.75rem; cursor: pointer; }
+.btn-translate-mini:hover { background: #dce8ff; }
+.translation-error { margin: 0.3rem 0 0; color: #b42318; font-size: 0.75rem; }
 .tg-link-mini { font-size: 0.7rem; padding: 1px 4px; background: #e3f2fd; border-radius: 3px; text-decoration: none; }
 .tg-link-mini:hover { background: #0088cc; color: white; }
 .loading-mini { text-align: center; padding: 8px; color: #666; font-size: 0.8rem; }
@@ -1079,24 +1474,32 @@ reloadGraph() {
 .more-items-link:hover { text-decoration: underline; }
 .expanded-list { margin-top: 4px; border-top: 1px dashed #ddd; padding-top: 4px; }
 
-@media (max-width: 768px) {
-  .graph-layout { flex-direction: column; }
-  .legend { order: -1; }
-  .graph-container { height: 50vh; }
-  .edge-summary-visual { flex-direction: column; gap: 1rem; }
-}
-.category-select {
-  padding: 0.6rem;
-  border: 1px solid #ccc;
-  border-radius: 6px;
-  background: #fff;
-  font-size: 0.95rem;
-  max-width: 220px;
-  cursor: pointer;
+@media (max-width: 1100px) {
+  .stats-box { grid-template-columns: repeat(3, minmax(145px, 1fr)); }
+  .toolbar-search { grid-template-columns: minmax(170px, 0.8fr) minmax(260px, 1.7fr) 78px auto; }
 }
 
-.category-select:focus {
-  outline: none;
-  border-color: #3558ff;
+@media (max-width: 768px) {
+  .graph-page { padding: 1rem 0.5rem 2rem; }
+  .graph-header { flex-direction: column; gap: 0.7rem; }
+  .page-title { font-size: 2rem; }
+  .graph-health { margin-top: 0; }
+  .stats-box { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .stat-item { min-height: 65px; padding: 0.65rem; }
+  .stat-item small { white-space: normal; }
+  .toolbar-search { grid-template-columns: 1fr 72px; }
+  .category-field, .search-field { grid-column: 1 / -1; }
+  .search-btn { width: 100%; }
+  .view-controls { flex-wrap: wrap; }
+  .view-label { width: 100%; }
+  .stage-header { align-items: flex-start; }
+  .stage-header p { display: none; }
+  .graph-layout { display: flex; flex-direction: column; min-height: 0; }
+  .graph-container { height: 56vh; min-height: 440px; }
+  .legend { position: relative; top: auto; right: auto; width: auto; max-height: none; margin: 0.75rem; order: 2; }
+  .graph-loading { bottom: auto; height: 56vh; min-height: 440px; }
+  .community-filter-banner { align-items: flex-start; flex-direction: column; }
+  .modal { width: 100%; border-radius: 0; padding: 1.2rem 1rem 1.5rem; }
+  .edge-summary-visual { flex-direction: column; gap: 1rem; }
 }
 </style>

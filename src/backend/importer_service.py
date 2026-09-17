@@ -7,6 +7,8 @@ import sys
 import time
 import re
 import json
+import qrcode
+import subprocess
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -165,22 +167,22 @@ async def get_channel_by_title(client: TelegramClient, title: str):
     Prova prima match esatto, poi match parziale.
     """
     title_lower = str(title).lower().strip()
-    
+
     # Prima passata: match esatto
     async for dialog in client.iter_dialogs():
         if dialog.title and str(dialog.title).lower().strip() == title_lower:
             return dialog.entity
-    
+
     # Seconda passata: match parziale (il titolo contiene la stringa cercata)
     async for dialog in client.iter_dialogs():
         if dialog.title and title_lower in str(dialog.title).lower():
             return dialog.entity
-    
+
     # Terza passata: la stringa cercata contiene il titolo
     async for dialog in client.iter_dialogs():
         if dialog.title and str(dialog.title).lower() in title_lower:
             return dialog.entity
-    
+
     return None
 
 
@@ -189,13 +191,13 @@ async def get_channel_by_username(client: TelegramClient, username: str):
     Cerca una chat nei dialoghi per username.
     """
     username_lower = str(username).lower().strip().lstrip("@")
-    
+
     async for dialog in client.iter_dialogs():
         entity = dialog.entity
         entity_username = getattr(entity, "username", None)
         if entity_username and entity_username.lower() == username_lower:
             return entity
-    
+
     return None
 
 async def get_admins_for_chat(client, entity):
@@ -288,7 +290,7 @@ async def authenticate_session():
     """
     Esegui questo script UNA SOLA VOLTA da terminale per creare la sessione.
     Dopo l'autenticazione, la sessione sarà riutilizzabile per tutte le scansioni.
-    
+
     Uso: python importer_service.py --auth
     """
     print("=" * 60)
@@ -296,12 +298,12 @@ async def authenticate_session():
     print("=" * 60)
     print(f"File sessione: {SESSION_FILE}.session")
     print()
-    
+
     client = TelegramClient(str(SESSION_FILE), API_ID, API_HASH)
-    
+
     try:
         await client.connect()
-        
+
         if await client.is_user_authorized():
             me = await client.get_me()
             print(f"✅ Sessione già autenticata!")
@@ -309,21 +311,23 @@ async def authenticate_session():
             print(f"   Username: @{me.username}" if me.username else "   Username: (nessuno)")
             print(f"   ID: {me.id}")
             return True
-        
+
         # Richiedi numero di telefono
         phone = input("Inserisci il numero di telefono (con prefisso, es: +39...): ").strip()
-        
+
         if not phone:
             print("❌ Numero di telefono non inserito.")
             return False
-        
-        # Invia richiesta codice
-        await client.send_code_request(phone)
-        print(f"📱 Codice inviato a {phone}")
-        
+
+        # Invia richiesta codice e mostra il canale scelto da Telegram.
+        sent_code = await client.send_code_request(phone)
+        delivery = type(sent_code.type).__name__
+        next_delivery = type(sent_code.next_type).__name__ if sent_code.next_type else "nessuno"
+        print(f"📱 Richiesta codice accettata: canale={delivery}, prossimo_canale={next_delivery}, attesa={sent_code.timeout or 0}s")
+
         # Richiedi codice
         code = input("Inserisci il codice ricevuto: ").strip()
-        
+
         try:
             await client.sign_in(phone, code)
         except Exception as e:
@@ -333,7 +337,7 @@ async def authenticate_session():
                 await client.sign_in(password=password)
             else:
                 raise e
-        
+
         me = await client.get_me()
         print()
         print("=" * 60)
@@ -346,9 +350,42 @@ async def authenticate_session():
         print(f"📁 Sessione salvata in: {SESSION_FILE}.session")
         print("   Ora puoi avviare l'applicazione normalmente.")
         return True
-        
+
     except Exception as e:
         print(f"❌ Errore durante l'autenticazione: {e}")
+        return False
+    finally:
+        await client.disconnect()
+
+
+async def authenticate_session_qr():
+    """Autentica la sessione tramite QR scansionato dall'app Telegram."""
+    print("=" * 60)
+    print("AUTENTICAZIONE TELEGRAM TRAMITE QR")
+    print("=" * 60)
+    print("Apri Telegram > Impostazioni > Dispositivi > Collega dispositivo desktop")
+
+    client = TelegramClient(str(SESSION_FILE), API_ID, API_HASH)
+    try:
+        await client.connect()
+        if await client.is_user_authorized():
+            print("✅ Sessione già autenticata.")
+            return True
+
+        qr_login = await client.qr_login()
+        qr = qrcode.QRCode(border=1)
+        qr.add_data(qr_login.url)
+        qr.make(fit=True)
+        qr.print_ascii(invert=True)
+        print("Scansiona il QR dal telefono. In attesa...")
+        await qr_login.wait()
+
+        me = await client.get_me()
+        print(f"✅ Autenticazione completata per @{me.username or '(nessun username)'}")
+        print(f"📁 Sessione salvata in: {SESSION_FILE}.session")
+        return True
+    except Exception as e:
+        print(f"❌ Errore autenticazione QR: {e}")
         return False
     finally:
         await client.disconnect()
@@ -370,22 +407,30 @@ async def create_telegram_client() -> Optional[TelegramClient]:
     if not is_session_authenticated():
         logger.error("File di sessione non trovato. Esegui prima: python importer_service.py --auth")
         return None
-    
+
     # Crea nuovo client
-    client = TelegramClient(str(SESSION_FILE), API_ID, API_HASH)
-    
+    client = TelegramClient(
+        str(SESSION_FILE),
+        API_ID,
+        API_HASH,
+        timeout=15,
+        connection_retries=3,
+        request_retries=3,
+    )
+
     try:
-        await client.connect()
-        
+        logger.info("Connessione a Telegram in corso...")
+        await asyncio.wait_for(client.connect(), timeout=45)
+
         if not await client.is_user_authorized():
             logger.error("Sessione non autorizzata. Esegui: python importer_service.py --auth")
             await client.disconnect()
             return None
-        
+
         me = await client.get_me()
         logger.info(f"Client Telegram connesso come: {me.first_name} (@{me.username or 'N/A'})")
         return client
-        
+
     except Exception as e:
         logger.error(f"Errore connessione Telegram: {e}")
         try:
@@ -407,7 +452,7 @@ async def get_telegram_client() -> Optional[TelegramClient]:
 # =====================================================
 # CORE LOGIC (CORRETTO)
 # =====================================================
-async def run_import_task(target: str, mode: str = "incrementale"):
+async def run_import_task(target: str, mode: str = "incrementale", entity_override=None):
     """
     Funzione principale che esegue l'importazione per un singolo target.
     Usa la sessione unica già autenticata.
@@ -416,12 +461,12 @@ async def run_import_task(target: str, mode: str = "incrementale"):
 
     target_key = str(target)
     original_target = str(target).strip()
-    
+
     IMPORT_STATUS[target_key] = {"status": "running", "progress": "Avvio connessione Telegram..."}
 
     conn = None
     client = None
-    
+
     try:
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
@@ -432,17 +477,17 @@ async def run_import_task(target: str, mode: str = "incrementale"):
         # SE IL TARGET È UN ID NUMERICO, RECUPERA IL NOME DAL DB
         # =====================================================
         search_target = original_target
-        
+
         if re.match(r'^-?\d+$', original_target):
             chat_id_num = int(original_target)
             logger.info(f"Target è un ID numerico ({chat_id_num}), cerco il nome nel DB...")
-            
+
             cursor.execute(
                 "SELECT nome_chat, username FROM chat WHERE id_chat = %s OR id_chat = %s",
                 (chat_id_num, -chat_id_num)
             )
             row = cursor.fetchone()
-            
+
             if row:
                 # Priorità: username > nome_chat
                 if row.get("username"):
@@ -459,7 +504,7 @@ async def run_import_task(target: str, mode: str = "incrementale"):
         # CREA UN NUOVO CLIENT PER QUESTO TASK
         # =====================================================
         client = await create_telegram_client()
-        
+
         if client is None:
             IMPORT_STATUS[target_key] = {
                 "status": "error",
@@ -477,29 +522,39 @@ async def run_import_task(target: str, mode: str = "incrementale"):
         # =====================================================
         entity = None
         target_str = str(search_target).strip()
-        
+
+        if entity_override is not None:
+            try:
+                # L'entità arriva da un altro client Telethon: risolverla nel
+                # client che esegue effettivamente l'import evita iterazioni vuote.
+                entity = await client.get_entity(entity_override)
+                logger.info("Entità risolta nel client di importazione")
+            except Exception as exc:
+                logger.warning(f"Impossibile riusare l'entità del dialogo: {exc}")
+
         # Rimuovi eventuale @ iniziale
         if target_str.startswith("@"):
             target_str = target_str[1:]
-        
-        logger.info(f"Inizio ricerca per: '{target_str}'")
-        
+
+        if entity is None:
+            logger.info(f"Inizio ricerca per: '{target_str}'")
+
         # STRATEGIA 1: Cerca per username (es: "PsychonautWiki" o "psychonautwiki_music")
-        if not re.match(r'^-?\d+$', target_str):
+        if entity is None and not re.match(r'^-?\d+$', target_str):
             try:
                 # Prova come username diretto
                 entity = await client.get_entity(target_str)
                 logger.info(f"Trovato per username: {target_str}")
             except Exception as e:
                 logger.warning(f"get_entity(username) fallito per '{target_str}': {e}")
-        
+
         # STRATEGIA 2: Cerca nei dialoghi per titolo/nome
         if entity is None:
             logger.info(f"Cerco nei dialoghi per titolo: {target_str}")
             entity = await get_channel_by_title(client, target_str)
             if entity:
                 logger.info(f"Trovato per titolo nei dialoghi: {getattr(entity, 'title', target_str)}")
-        
+
         # STRATEGIA 3: Se il target originale era un ID numerico, cerca nei dialoghi per ID
         if entity is None and re.match(r'^-?\d+$', original_target):
             target_id = int(original_target)
@@ -509,7 +564,7 @@ async def run_import_task(target: str, mode: str = "incrementale"):
                     entity = dialog.entity
                     logger.info(f"Trovato per ID nei dialoghi: {getattr(entity, 'title', target_id)}")
                     break
-        
+
         # STRATEGIA 4: Ultimo tentativo con get_entity su ID (funziona solo se sei nel gruppo)
         if entity is None and re.match(r'^-?\d+$', original_target):
             try:
@@ -566,12 +621,12 @@ async def run_import_task(target: str, mode: str = "incrementale"):
         # =====================================================
         ultima_scansione = ensure_utc_naive(datetime.datetime.now(datetime.timezone.utc))
         chat_username = getattr(entity, "username", None)
-        
+
         cursor.execute("""
-            INSERT INTO chat (id_chat, nome_chat, username, ultima_scansione) 
+            INSERT INTO chat (id_chat, nome_chat, username, ultima_scansione)
             VALUES (%s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE 
-                nome_chat=VALUES(nome_chat), 
+            ON DUPLICATE KEY UPDATE
+                nome_chat=VALUES(nome_chat),
                 username=VALUES(username),
                 ultima_scansione=VALUES(ultima_scansione)
         """, (chat_id, nome_chat, chat_username, ultima_scansione))
@@ -598,7 +653,7 @@ async def run_import_task(target: str, mode: str = "incrementale"):
             if not IS_STORICO and isinstance(last_saved_id, int) and message.id <= last_saved_id:
                 break
 
-            if not message or (message.sender_id is None and not message.action):
+            if not message:
                 continue
 
             if message.sender_id:
@@ -624,7 +679,7 @@ async def run_import_task(target: str, mode: str = "incrementale"):
                 if not nome_utente and username_u:
                     nome_utente = f"@{username_u}"
 
-                if sender.id not in foto_cache and getattr(sender, "photo", None):
+                if not SKIP_MEDIA and sender.id not in foto_cache and getattr(sender, "photo", None):
                     foto_filename = PHOTOS_DIR / f"{sender.id}.jpg"
                     if not foto_filename.exists():
                         try:
@@ -711,7 +766,7 @@ async def run_import_task(target: str, mode: str = "incrementale"):
 
         elapsed = time.time() - start_time
         IMPORT_STATUS[target_key] = {
-            "status": "done", 
+            "status": "done",
             "progress": f"✅ Completato! {processed} messaggi in {elapsed:.1f}s"
         }
         logger.info(f"Import completato per '{target}': {processed} messaggi in {elapsed:.1f}s")
@@ -750,14 +805,14 @@ async def check_session_status() -> dict:
             "authenticated": False,
             "message": "Nessuna sessione trovata. Esegui: python importer_service.py --auth"
         }
-    
+
     client = await create_telegram_client()
     if client is None:
         return {
             "authenticated": False,
             "message": "Sessione non valida o scaduta. Esegui: python importer_service.py --auth"
         }
-    
+
     try:
         me = await client.get_me()
         return {
@@ -796,28 +851,28 @@ async def list_dialogs():
     """
     Lista tutti i dialoghi (chat/gruppi/canali) disponibili.
     Utile per debug e per trovare il nome corretto da usare.
-    
+
     Uso: python importer_service.py --list
     """
     client = await create_telegram_client()
     if not client:
         print("❌ Sessione non autenticata. Esegui prima: python importer_service.py --auth")
         return
-    
+
     try:
         print("=" * 80)
         print("ELENCO DIALOGHI DISPONIBILI")
         print("=" * 80)
         print(f"{'ID':<15} {'Tipo':<12} {'Username':<25} {'Nome'}")
         print("-" * 80)
-        
+
         count = 0
         async for dialog in client.iter_dialogs():
             entity = dialog.entity
             entity_type = type(entity).__name__
             username = getattr(entity, "username", "") or ""
             title = dialog.title or getattr(entity, "first_name", "") or str(entity.id)
-            
+
             # Formatta tipo
             if entity_type == "Channel":
                 if getattr(entity, "megagroup", False):
@@ -828,14 +883,14 @@ async def list_dialogs():
                 entity_type = "Gruppo"
             elif entity_type == "User":
                 entity_type = "Utente"
-            
+
             print(f"{entity.id:<15} {entity_type:<12} @{username:<24} {title}")
             count += 1
-            
+
             if count >= 100:  # Limita a 100 per non sovraccaricare
                 print(f"\n... e altri dialoghi (mostrati i primi 100)")
                 break
-        
+
         print("-" * 80)
         print(f"Totale mostrati: {count}")
         print("\nUsa il NOME o lo USERNAME (senza @) per avviare la scansione.")
@@ -843,12 +898,117 @@ async def list_dialogs():
         await client.disconnect()
 
 
+async def import_all_dialogs():
+    """Scansiona in sequenza tutti i gruppi e canali accessibili."""
+    client = await create_telegram_client()
+    if not client:
+        print("❌ Sessione non autenticata. Esegui prima l'autenticazione.")
+        return False
+
+    targets = []
+    try:
+        async for dialog in client.iter_dialogs():
+            entity = dialog.entity
+            if isinstance(entity, (Channel, Chat)):
+                targets.append((entity.id, dialog.title or str(entity.id)))
+    finally:
+        await client.disconnect()
+
+    print(f"Trovati {len(targets)} gruppi/canali da scansionare.")
+    completed = 0
+    failed = 0
+    for index, (target_id, title) in enumerate(targets, start=1):
+        print(f"\n[{index}/{len(targets)}] Scansione: {title} ({target_id})")
+        try:
+            # Passiamo l'ID del dialogo corrente: `entity` qui sarebbe
+            # l'ultima entità iterata e potrebbe riferirsi a un'altra chat.
+            await run_import_task(str(target_id), "incrementale")
+            if IMPORT_STATUS.get(str(target_id), {}).get("status") == "error":
+                failed += 1
+            else:
+                completed += 1
+        except Exception as exc:
+            failed += 1
+            print(f"❌ Errore nella chat {target_id}: {exc}")
+
+    print(f"\nScansione globale completata: {completed} riuscite, {failed} fallite.")
+    return completed > 0
+
+
+async def download_pending_media(limit: Optional[int] = None):
+    """Scarica i media già censiti in MySQL ma non ancora presenti su disco."""
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    client = None
+    try:
+        sql = """
+            SELECT id_chat, id_messaggio, file_path
+            FROM messaggi
+            WHERE file_path IS NOT NULL AND file_path <> ''
+            ORDER BY data_invio DESC
+        """
+        params = ()
+        if limit is not None:
+            sql += " LIMIT %s"
+            params = (limit,)
+        cursor.execute(sql, params)
+
+        pending = []
+        for row in cursor.fetchall():
+            filename = BASE_DIR / row["file_path"]
+            if not filename.exists():
+                pending.append((row["id_chat"], row["id_messaggio"], filename))
+
+        print(f"Media mancanti da scaricare: {len(pending)}")
+        if not pending:
+            return
+
+        client = await create_telegram_client()
+        if client is None:
+            print("❌ Connessione Telegram non disponibile.")
+            return
+
+        sem = asyncio.Semaphore(MAX_MEDIA_CONCURRENCY)
+        for start in range(0, len(pending), BATCH_SIZE):
+            batch = pending[start:start + BATCH_SIZE]
+            await asyncio.gather(*[
+                download_media_by_id(client, item, sem) for item in batch
+            ])
+            print(f"Scaricati/elaborati {min(start + len(batch), len(pending))}/{len(pending)} media")
+    finally:
+        cursor.close()
+        conn.close()
+        if client:
+            await client.disconnect()
+
+
+def sync_graph_incremental():
+    """Avvia la sincronizzazione incrementale MySQL -> Neo4j."""
+    script = BASE_DIR / "SyncMySQLNeo4j2_0.py"
+    subprocess.run([sys.executable, str(script)], check=True, cwd=BASE_DIR)
+
+
+async def run_fast_pipeline():
+    """Import testuale rapido e successiva sincronizzazione del grafo."""
+    global SKIP_MEDIA
+    SKIP_MEDIA = True
+    print("🚀 Importazione rapida: download media disattivato")
+    imported = await import_all_dialogs()
+    if not imported:
+        print("\n❌ Importazione non avviata: sincronizzazione del grafo annullata.")
+        return
+    print("\n🔗 Aggiornamento incrementale del grafo...")
+    sync_graph_incremental()
+
+
 if __name__ == "__main__":
     import sys
-    
+
     if len(sys.argv) > 1 and sys.argv[1] == "--auth":
         # Modalità autenticazione
         asyncio.run(authenticate_session())
+    elif len(sys.argv) > 1 and sys.argv[1] == "--qr":
+        asyncio.run(authenticate_session_qr())
     elif len(sys.argv) > 1 and sys.argv[1] == "--status":
         # Verifica stato sessione
         status = asyncio.run(check_session_status())
@@ -856,10 +1016,21 @@ if __name__ == "__main__":
     elif len(sys.argv) > 1 and sys.argv[1] == "--list":
         # Lista tutti i dialoghi
         asyncio.run(list_dialogs())
+    elif len(sys.argv) > 1 and sys.argv[1] == "--all":
+        asyncio.run(import_all_dialogs())
+    elif len(sys.argv) > 1 and sys.argv[1] == "--pipeline":
+        asyncio.run(run_fast_pipeline())
+    elif len(sys.argv) > 1 and sys.argv[1] == "--media":
+        media_limit = int(sys.argv[2]) if len(sys.argv) > 2 else None
+        asyncio.run(download_pending_media(media_limit))
     else:
         print("Uso:")
         print("  python importer_service.py --auth    # Autentica la sessione Telegram")
+        print("  python importer_service.py --qr      # Autentica tramite QR Telegram")
         print("  python importer_service.py --status  # Verifica stato sessione")
         print("  python importer_service.py --list    # Lista tutti i gruppi/canali disponibili")
+        print("  python importer_service.py --all     # Scansiona tutti i gruppi/canali")
+        print("  python importer_service.py --pipeline # Import rapido + sync grafo")
+        print("  python importer_service.py --media [N] # Scarica i media mancanti")
         print()
         print("Dopo l'autenticazione, avvia l'applicazione Flask normalmente.")

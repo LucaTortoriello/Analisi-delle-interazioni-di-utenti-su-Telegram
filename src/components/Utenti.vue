@@ -1,7 +1,14 @@
 <template>
-  <div>
-    <h1 class="page-title" v-if="!userId">Utenti</h1>
-    <h1 class="page-title" v-else>Dettaglio Utente</h1>
+  <div class="app-section users-page">
+    <header class="app-page-header">
+      <div>
+        <span class="app-eyebrow">People intelligence</span>
+        <h1 class="page-title">{{ userId ? 'Dettaglio utente' : 'Utenti' }}</h1>
+        <p class="app-page-description">
+          {{ userId ? 'Profilo, attività, presenza nelle chat e segnali OSINT.' : 'Cerca e analizza gli utenti presenti nelle conversazioni importate.' }}
+        </p>
+      </div>
+    </header>
 
     <div v-if="!userId">
       <div class="search-bar-group">
@@ -336,6 +343,7 @@
                   <span class="lang-flag">🇮🇹</span> {{ msg.testo_tradotto }}
                 </div>
               </div>
+              <div v-if="msg.translation_error" class="translation-error">{{ msg.translation_error }}</div>
             </div>
 
             <div class="msg-actions">
@@ -456,6 +464,7 @@
 </template>
 
 <script>
+import { franc } from "franc-min";
 export default {
   name: "Utenti",
   data() {
@@ -560,17 +569,20 @@ export default {
     async traduci(m) {
       try {
         m.translating = true;
+        m.translation_error = "";
         const res = await fetch(`http://127.0.0.1:5000/api/traduci`, {
           method: "POST",
-          body: JSON.stringify({ q: m.testo }),
+          body: JSON.stringify({ q: m.testo, source: franc(m.testo || "") }),
           headers: { "Content-Type": "application/json" }
         });
         const json = await res.json();
+        if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
         if (json.translatedText) {
           m.testo_tradotto = json.translatedText;
         }
       } catch (e) {
         console.error("Errore traduzione:", e);
+        m.translation_error = e.message || "Traduzione non disponibile";
       } finally {
         m.translating = false;
       }
@@ -761,12 +773,12 @@ export default {
 }
 
 .page-title {
-  font-size: 1.8rem;
+  font-size: clamp(2rem, 3vw, 2.65rem);
   font-weight: 700;
-  margin-bottom: 1.8rem;
-  color: var(--primary);
-  letter-spacing: -0.3px;
-  line-height: 1.25;
+  margin: 0 0 0.35rem;
+  color: #0f172a;
+  letter-spacing: -0.04em;
+  line-height: 1.08;
 }
 
 .section-container {
@@ -785,15 +797,15 @@ export default {
   background: var(--bg-card);
   backdrop-filter: blur(12px);
   border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-soft);
-  padding: 1.6rem;
-  margin: 1.5rem 0;
-  transition: all 0.3s ease;
+  box-shadow: 0 4px 18px rgba(15,23,42,0.045);
+  padding: 1.25rem;
+  margin: 1rem 0;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
   border: 1px solid var(--border);
 }
 .card:hover {
-  transform: translateY(-2px);
-  box-shadow: var(--shadow-hover);
+  border-color: #cbd5e1;
+  box-shadow: 0 8px 24px rgba(15,23,42,0.065);
 }
 
 .header {
@@ -821,25 +833,32 @@ export default {
 }
 
 .search-bar-group {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 1rem;
-  margin-bottom: 2rem;
-  justify-content: center;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(280px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+  padding: 0.9rem;
+  border: 1px solid #dfe6ef;
+  border-radius: 15px;
+  background: #fff;
+  box-shadow: 0 4px 18px rgba(15,23,42,0.045);
 }
 .input-with-btn {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: .6rem;
+  gap: 0.5rem;
 }
 .input {
-  padding: .9rem 1.1rem;
-  border-radius: var(--radius-lg);
+  width: 100%;
+  height: 42px;
+  padding: 0 0.85rem;
+  border-radius: 9px;
   border: 1px solid #dbe3f0;
   font-size: 0.95rem;
   background: #fff;
   transition: all 0.25s ease;
-  min-width: 220px;
+  min-width: 0;
 }
 .input:focus {
   border-color: var(--primary);
@@ -848,8 +867,9 @@ export default {
 }
 
 .btn {
-  padding: .7rem 1.4rem;
-  border-radius: var(--radius-lg);
+  min-height: 42px;
+  padding: .65rem 1.1rem;
+  border-radius: 9px;
   border: none;
   background: linear-gradient(135deg, #2563eb, #1e40af);
   cursor: pointer;
@@ -908,7 +928,8 @@ export default {
   background: white;
   border-radius: var(--radius-lg);
   overflow: hidden;
-  box-shadow: var(--shadow-soft);
+  border: 1px solid #e2e8f0;
+  box-shadow: none;
 }
 .table th {
   background: #f8fafc;
@@ -1391,4 +1412,11 @@ export default {
 }
 .text-primary { color: #0284c7; font-weight: 600; }
 .text-muted { color: #64748b; font-size: 0.75rem; }
+
+@media (max-width: 768px) {
+  .search-bar-group { grid-template-columns: 1fr; padding: 0.7rem; }
+  .input-with-btn { grid-template-columns: 1fr; }
+  .card { padding: 0.9rem; overflow-x: auto; }
+  .header { align-items: flex-start; flex-direction: column; }
+}
 </style>

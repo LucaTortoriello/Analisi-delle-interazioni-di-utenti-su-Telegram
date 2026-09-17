@@ -6,30 +6,70 @@ from importer_service import start_import_process, IMPORT_STATUS
 from mysql.connector import Error
 import os
 import json  # Importato globalmente per comodità
+import time
+from functools import lru_cache
 from flask import request
 import logging
 from dotenv import load_dotenv
 from datetime import datetime
-from deep_translator import GoogleTranslator
-from Neo4jConnector2_0 import run_query
+from deep_translator import GoogleTranslator, MyMemoryTranslator
+from deep_translator.exceptions import TooManyRequests
 from pathlib import Path
 from sangmata_service import queue_sangmata_request, get_request_status as get_sangmata_status
 
-def translate_if_needed(text: str) -> str:
-    """Traduci il testo in italiano se non è vuoto."""
-    try:
-        if not text:
-            return text
-        return GoogleTranslator(source="auto", target="it").translate(text)
-    except Exception:
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / "credenzialiDB.env")
+
+# Il driver Neo4j legge le credenziali durante l'import.
+from Neo4jConnector2_0 import run_query
+from graph_analysis_service import get_community_analysis
+
+_translation_lock = threading.Lock()
+_last_translation_at = 0.0
+_community_labels_lock = threading.Lock()
+_community_labels_cache = {"created_at": 0.0, "key": None, "value": None}
+MYMEMORY_LANGUAGES = {
+    "rus": "ru-RU", "ukr": "uk-UA", "eng": "en-US", "spa": "es-ES",
+    "fra": "fr-FR", "deu": "de-DE", "por": "pt-PT", "nld": "nl-NL",
+    "pol": "pl-PL", "tur": "tr-TR", "ara": "ar-SA", "heb": "he-IL",
+    "ell": "el-GR", "zho": "zh-CN", "jpn": "ja-JP", "kor": "ko-KR",
+    "hin": "hi-IN", "ron": "ro-RO", "ces": "cs-CZ", "bul": "bg-BG",
+}
+
+
+@lru_cache(maxsize=5000)
+def translate_if_needed(text: str, source_language: str = "und") -> str:
+    """Traduce una volta sola ogni testo e limita le richieste al provider."""
+    global _last_translation_at
+    if not text:
         return text
+
+    with _translation_lock:
+        elapsed = time.monotonic() - _last_translation_at
+        if elapsed < 0.35:
+            time.sleep(0.35 - elapsed)
+        try:
+            try:
+                translated = GoogleTranslator(source="auto", target="it").translate(text)
+            except TooManyRequests:
+                source = MYMEMORY_LANGUAGES.get(source_language)
+                if not source:
+                    raise
+                translated = MyMemoryTranslator(
+                    source=source,
+                    target="it-IT",
+                ).translate(text)
+        finally:
+            _last_translation_at = time.monotonic()
+
+    if not translated:
+        raise RuntimeError("Il servizio di traduzione non ha restituito un risultato")
+    return translated
 
 
 # =========================
 # Configurazione base
 # =========================
-load_dotenv()
-
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173"]}})
 
@@ -39,7 +79,7 @@ CORS(app, resources={r"/api/*": {"origins": ["http://localhost:5173", "http://12
 from flask_caching import Cache
 
 cache = Cache(app, config={
-    "CACHE_TYPE": "simple",          # cache in memoria del processo
+    "CACHE_TYPE": "SimpleCache",     # cache in memoria del processo
     "CACHE_DEFAULT_TIMEOUT": 60      # durata 60 secondi
 })
 
@@ -78,6 +118,91 @@ def get_connection():
             return mysql.connector.connect(**conn_args)
         # Se è un altro errore, rilanciamo per essere gestito a monte
         raise
+
+
+def enrich_community_labels(communities):
+    """Aggiunge etichette basate sulle chat che generano più reply."""
+    enriched = [dict(community) for community in communities]
+    cache_key = tuple(
+        (
+            community.get("id"),
+            community.get("size"),
+            tuple(community.get("top_chat_ids", [])),
+        )
+        for community in enriched
+    )
+    with _community_labels_lock:
+        cached = _community_labels_cache["value"]
+        if (
+            cached is not None
+            and _community_labels_cache["key"] == cache_key
+            and time.monotonic() - _community_labels_cache["created_at"] < 300
+        ):
+            return [dict(community) for community in cached]
+
+    chat_ids = {
+        int(chat_id)
+        for community in enriched
+        for chat_id in community.get("top_chat_ids", [])
+        if chat_id is not None
+    }
+    chats_by_id = {}
+    conn = cursor = None
+
+    if chat_ids:
+        try:
+            conn = get_connection()
+            cursor = conn.cursor(dictionary=True)
+            placeholders = ",".join(["%s"] * len(chat_ids))
+            cursor.execute(f"""
+                SELECT id_chat, nome_chat, nome_chat_tradotto, categoria_chat
+                FROM chat
+                WHERE id_chat IN ({placeholders})
+            """, tuple(chat_ids))
+            chats_by_id = {int(row["id_chat"]): row for row in cursor.fetchall()}
+        except Exception as exc:
+            logger.warning("Impossibile creare le etichette delle comunità: %s", exc)
+        finally:
+            if cursor:
+                cursor.close()
+            if conn:
+                conn.close()
+
+    for community in enriched:
+        top_chats = []
+        names = []
+        seen_names = set()
+        for chat_id in community.get("top_chat_ids", []):
+            chat = chats_by_id.get(int(chat_id))
+            if not chat:
+                continue
+            name = (chat.get("nome_chat_tradotto") or chat.get("nome_chat") or "").strip()
+            if not name:
+                continue
+            normalized_name = name.casefold()
+            if normalized_name in seen_names:
+                continue
+            seen_names.add(normalized_name)
+            short_name = name if len(name) <= 42 else f"{name[:39].rstrip()}…"
+            names.append(short_name)
+            top_chats.append({
+                "id": int(chat_id),
+                "name": name,
+                "category": chat.get("categoria_chat") or "",
+            })
+
+        community["top_chats"] = top_chats
+        community["label"] = " · ".join(names[:2]) or (
+            f"Gruppo di {community.get('size', 0)} utenti"
+        )
+
+    with _community_labels_lock:
+        _community_labels_cache.update({
+            "created_at": time.monotonic(),
+            "key": cache_key,
+            "value": enriched,
+        })
+    return enriched
 
 
 def pag_params():
@@ -214,7 +339,7 @@ def get_attivita():
             GROUP BY giorno
             ORDER BY giorno ASC
         """, (data_limite,))
-        
+
         rows = cursor.fetchall()
 
         labels = [r["giorno"].strftime("%Y-%m-%d") for r in rows]
@@ -302,12 +427,12 @@ def get_utente(user_id: int):
         # 2. Se non trovato, cerca nella tabella CHAT (es. Canale che scrive come utente)
         if not user:
             cursor.execute("""
-                SELECT id_chat AS id, nome_chat AS nome, NULL as username, 
-                       NULL as foto_path, data_importazione 
+                SELECT id_chat AS id, nome_chat AS nome, NULL as username,
+                       NULL as foto_path, data_importazione
                 FROM chat WHERE id_chat = %s
             """, (user_id,))
             chat_row = cursor.fetchone()
-            
+
             if chat_row:
                 user = chat_row
                 user["nome"] = (user["nome"] or "Canale senza nome") + " (Canale)"
@@ -349,7 +474,7 @@ def get_utente(user_id: int):
             ORDER BY messaggi_utente DESC
         """, (user_id,))
         chats = cursor.fetchall()
-        
+
         for c in chats:
             c["prima_interazione"] = to_iso_utc(c.get("prima_interazione"))
             c["ultima_interazione"] = to_iso_utc(c.get("ultima_interazione"))
@@ -485,10 +610,10 @@ def get_chats():
 
         # Seleziona tutte le colonne da chat (c) E il foto_path da utenti (u)
         select_clause = "c.id_chat, c.nome_chat, c.nome_chat_tradotto, c.tipo, c.ultima_scansione, c.data_importazione, c.categoria_chat, u.foto_path"
-        
+
         # LEFT JOIN: unisci chat.id_chat con utenti.id.
         join_clause = "LEFT JOIN utenti u ON c.id_chat = u.id"
-        
+
         where_clause = ""
         count_params = []
         select_params = []
@@ -497,7 +622,7 @@ def get_chats():
             where_clause = "WHERE c.categoria_chat = %s"
             count_params.append(categoria)
             select_params.append(categoria)
-            
+
             # Conta totale con filtro
             cursor.execute(f"SELECT COUNT(*) AS total FROM chat c {where_clause}", tuple(count_params))
             total = cursor.fetchone()["total"]
@@ -505,7 +630,7 @@ def get_chats():
         else:
             cursor.execute("SELECT COUNT(*) AS total FROM chat")
             total = cursor.fetchone()["total"]
-        
+
         # Aggiunge i parametri di paginazione
         select_params.extend([limit, offset])
 
@@ -518,7 +643,7 @@ def get_chats():
             ORDER BY c.ultima_scansione DESC
             LIMIT %s OFFSET %s
         """
-        
+
         cursor.execute(query, tuple(select_params))
         rows = cursor.fetchall()
 
@@ -528,7 +653,7 @@ def get_chats():
         admins_data = {}
         try:
             json_path = os.path.join(os.path.dirname(__file__), "admins.json")
-            
+
             if os.path.exists(json_path):
                 with open(json_path, "r", encoding="utf-8") as f:
                     admins_data = json.load(f)
@@ -539,11 +664,11 @@ def get_chats():
             r["ultima_scansione"] = to_iso_utc(r.get("ultima_scansione"))
             r["data_importazione"] = to_iso_utc(r.get("data_importazione"))
             r["avatar_url"] = to_download_url(r.get("foto_path"))
-            
+
             # --- INIEZIONE ADMIN ---
             chat_id_str = str(r["id_chat"])
             r["admins"] = admins_data.get(chat_id_str, [])
-            
+
             # Opzionale: Stringa riassuntiva
             if r["admins"]:
                 names = [a.get("nome") or a.get("username") or "Sconosciuto" for a in r["admins"]]
@@ -582,7 +707,7 @@ def get_chat_info(chat_id: int):
 
         cursor.execute("""
             SELECT id_chat, nome_chat, nome_chat_tradotto, tipo, ultima_scansione, categoria_chat
-            FROM chat 
+            FROM chat
             WHERE id_chat=%s
         """, (chat_id,))
         info = cursor.fetchone() or {}
@@ -612,7 +737,7 @@ def get_chat_info(chat_id: int):
             if os.path.exists(json_path):
                 with open(json_path, "r", encoding="utf-8") as f:
                     admins_data = json.load(f)
-            
+
             # Recupera gli admin per questo specifico ID
             info["admins"] = admins_data.get(str(chat_id), [])
         except Exception as e:
@@ -647,32 +772,32 @@ def get_messaggi(chat_id: int):
 
         # ✅ Query aggiornata con identificazione tipo autore
         cursor.execute("""
-            SELECT 
+            SELECT
                 m.id_messaggio,
                 m.id_chat,
                 m.id_autore,
                 m.reply_to_msg_id,
-                
+
                 -- ✅ IDENTIFICA TIPO AUTORE (canale ufficiale, canale esterno, utente)
-                CASE 
+                CASE
                     WHEN m.id_autore = m.id_chat AND m.id_autore < 0 THEN 'channel_official'
                     WHEN m.id_autore < 0 THEN 'channel_external'
                     WHEN m.id_autore > 0 THEN 'user'
                     ELSE 'unknown'
                 END AS author_type,
-                
+
                 -- Dati utente normale
                 u1.nome AS autore_nome,
                 u1.username AS autore_username,
                 u1.foto_path,
-                
+
                 -- Dati messaggio
                 m.testo,
                 m.data_invio,
                 m.tipo_evento,
                 m.file_path,
                 m.media_type,
-                
+
                 -- Dati chat (per nome del canale)
                 c.nome_chat AS provenienza,
                 c.nome_chat_tradotto AS provenienza_tradotta,
@@ -687,7 +812,7 @@ def get_messaggi(chat_id: int):
             FROM messaggi m
             LEFT JOIN utenti u1 ON m.id_autore = u1.id
             LEFT JOIN chat c ON m.id_chat = c.id_chat
-            LEFT JOIN messaggi m2 
+            LEFT JOIN messaggi m2
                 ON CAST(TRIM(m.reply_to_msg_id) AS CHAR) = CAST(m2.id_messaggio AS CHAR)
                 AND m.id_chat = m2.id_chat
             LEFT JOIN utenti u2 ON m2.id_autore = u2.id
@@ -709,23 +834,23 @@ def get_messaggi(chat_id: int):
                 r["is_channel_post"] = True
 
                 r["avatar_url"] = to_download_url(r.get("foto_path_chat") or r.get("foto_path"))
-                
+
             elif r["author_type"] == "channel_external":
                 # È un altro canale che scrive
                 r["nome"] = f"Canale Esterno {abs(r['id_autore'])}"
                 r["autore_nome"] = r["nome"]
                 r["autore_username"] = None
                 r["is_channel_post"] = False
-                
+
             else:
                 # È un utente normale
                 r["autore_nome"] = clean_nome(r.get("autore_nome"), r.get("autore_username"))
                 r["nome"] = r["autore_nome"]
                 r["is_channel_post"] = False
-            
+
             # Nome utente a cui si risponde
             r["reply_to_nome"] = clean_nome(r.get("reply_to_nome"), r.get("reply_to_username"))
-            
+
             # Pulizia e fallback
             r["reply_to_id"] = r.get("reply_to_id") or None
             r["reply_to_username"] = r.get("reply_to_username") or ""
@@ -781,19 +906,19 @@ def get_reply_utente(user_id: int):
 
         # ✅ Query corretta con verifiche aggiuntive
         cursor.execute("""
-            SELECT 
+            SELECT
                 m.id_messaggio,
                 m.testo AS reply_text,
                 m.data_invio,
                 m.tipo_evento,
                 m.id_chat,
-                c.nome_chat, 
+                c.nome_chat,
                 c.nome_chat_tradotto,
 
                 -- AUTORE (Chi risponde - sempre l'utente richiesto)
                 m.id_autore AS autore_id,
-                u1.nome AS u1_nome, 
-                u1.username AS u1_user, 
+                u1.nome AS u1_nome,
+                u1.username AS u1_user,
                 u1.foto_path AS u1_foto,
                 c1.nome_chat AS c1_nome,
 
@@ -801,21 +926,21 @@ def get_reply_utente(user_id: int):
                 m2.id_messaggio AS original_msg_id,
                 m2.testo AS original_text,
                 m2.id_autore AS reply_to_user_id,
-                u2.nome AS u2_nome, 
-                u2.username AS u2_user, 
+                u2.nome AS u2_nome,
+                u2.username AS u2_user,
                 u2.foto_path AS u2_foto,
                 c2.nome_chat AS c2_nome
 
             FROM messaggi m
             INNER JOIN chat c ON c.id_chat = m.id_chat
-            
+
             -- Join Autore
             LEFT JOIN utenti u1 ON m.id_autore = u1.id
-            LEFT JOIN chat c1 ON m.id_autore = c1.id_chat 
-            
+            LEFT JOIN chat c1 ON m.id_autore = c1.id_chat
+
             -- 🔥 FIX CRITICO: Join solo messaggi nella STESSA CHAT
-            LEFT JOIN messaggi m2 
-                ON m.reply_to_msg_id = m2.id_messaggio 
+            LEFT JOIN messaggi m2
+                ON m.reply_to_msg_id = m2.id_messaggio
                 AND m.id_chat = m2.id_chat
             LEFT JOIN utenti u2 ON m2.id_autore = u2.id
             LEFT JOIN chat c2 ON m2.id_autore = c2.id_chat
@@ -828,7 +953,7 @@ def get_reply_utente(user_id: int):
         """, (user_id,))
 
         rows = cursor.fetchall()
-        
+
         # 🔥 FILTRO POST-QUERY: Rimuovi reply senza messaggio originale valido
         valid_replies = []
         general = []
@@ -838,7 +963,7 @@ def get_reply_utente(user_id: int):
             # Salta se non c'è messaggio originale valido
             if not r.get("original_msg_id"):
                 continue
-                
+
             r["data_invio"] = to_iso_utc(r["data_invio"])
 
             # LOGICA NOME AUTORE (Priorità: Utente -> Chat -> Fallback ID)
@@ -880,7 +1005,7 @@ def get_reply_utente(user_id: int):
             # Keyword Detection
             reply_txt = r.get("reply_text") or ""
             orig_txt = r.get("original_text") or ""
-            
+
             r["keyword_count_reply"] = 0
             r["keyword_count_original"] = 0
             r["keyword_context"] = None
@@ -891,7 +1016,7 @@ def get_reply_utente(user_id: int):
                 k2 = orig_txt.lower().count(keyword)
                 r["keyword_count_reply"] = k1
                 r["keyword_count_original"] = k2
-                
+
                 if k1 > 0:
                     idx = reply_txt.lower().find(keyword)
                     start = max(0, idx - 40)
@@ -906,28 +1031,200 @@ def get_reply_utente(user_id: int):
             if has_kw:
                 kw_rels.append(r)
 
-        if mode == "keyword": 
+        if mode == "keyword":
             return jsonify({"status": "success", "data": kw_rels})
         if mode == "both":
             return jsonify({
-                "status": "success", 
+                "status": "success",
                 "keyword": keyword,
                 "general_relations": general,
                 "keyword_relations": kw_rels,
                 "keyword_relations_count": len(kw_rels)
             })
-            
+
         return jsonify({"status": "success", "data": general})
 
     except Exception as e:
         logger.error(f"Errore DB reply_utente: {e}", exc_info=True)
         return jsonify({"status": "error", "message": str(e)}), 500
     finally:
-        try: 
+        try:
             cursor.close()
             conn.close()
-        except: 
+        except:
             pass
+
+
+@app.route("/api/graph/edge/<int:from_id>/<int:to_id>", methods=["GET"])
+@cache.cached(timeout=60)
+def get_graph_edge_details(from_id: int, to_id: int):
+    """Dettaglio verificabile di un arco con una sola richiesta frontend."""
+    if from_id == to_id:
+        return jsonify({"status": "error", "message": "Gli utenti devono essere distinti"}), 400
+
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute("""
+            SELECT m.id_autore AS source_id,
+                   original.id_autore AS target_id,
+                   COUNT(*) AS reply_count
+            FROM messaggi m
+            INNER JOIN messaggi original
+              ON original.id_chat = m.id_chat
+             AND original.id_messaggio = m.reply_to_msg_id
+            WHERE m.id_autore IN (%s, %s)
+              AND original.id_autore IN (%s, %s)
+              AND m.id_autore <> original.id_autore
+              AND m.reply_to_msg_id IS NOT NULL
+              AND TRIM(m.reply_to_msg_id) <> ''
+              AND m.reply_to_msg_id <> '0'
+            GROUP BY m.id_autore, original.id_autore
+        """, (from_id, to_id, from_id, to_id))
+        counts = {
+            (int(row["source_id"]), int(row["target_id"])): int(row["reply_count"])
+            for row in cursor.fetchall()
+        }
+        forward = counts.get((from_id, to_id), 0)
+        reverse = counts.get((to_id, from_id), 0)
+        total = forward + reverse
+
+        cursor.execute("""
+            SELECT u.id, u.nome, u.username, u.foto_path
+            FROM utenti u
+            WHERE u.id IN (%s, %s)
+        """, (from_id, to_id))
+        users = {}
+        for row in cursor.fetchall():
+            row["nome"] = clean_nome(row.get("nome"), row.get("username"))
+            row["avatar_url"] = to_download_url(row.get("foto_path"))
+            row.pop("foto_path", None)
+            users[int(row["id"])] = row
+
+        cursor.execute("""
+            SELECT m.id_messaggio,
+                   m.id_chat,
+                   m.testo AS reply_text,
+                   m.data_invio,
+                   m.tipo_evento,
+                   m.id_autore AS autore_id,
+                   original.id_messaggio AS original_msg_id,
+                   original.testo AS original_text,
+                   original.id_autore AS reply_to_user_id,
+                   c.nome_chat,
+                   c.nome_chat_tradotto,
+                   c.username AS chat_username,
+                   author.nome AS autore_nome,
+                   author.username AS autore_username,
+                   author.foto_path AS autore_foto,
+                   recipient.nome AS reply_to_nome,
+                   recipient.username AS reply_to_username,
+                   recipient.foto_path AS reply_to_foto
+            FROM messaggi m
+            INNER JOIN messaggi original
+              ON original.id_chat = m.id_chat
+             AND original.id_messaggio = m.reply_to_msg_id
+            INNER JOIN chat c ON c.id_chat = m.id_chat
+            LEFT JOIN utenti author ON author.id = m.id_autore
+            LEFT JOIN utenti recipient ON recipient.id = original.id_autore
+            WHERE m.id_autore IN (%s, %s)
+              AND original.id_autore IN (%s, %s)
+              AND m.id_autore <> original.id_autore
+              AND m.reply_to_msg_id IS NOT NULL
+              AND TRIM(m.reply_to_msg_id) <> ''
+              AND m.reply_to_msg_id <> '0'
+            ORDER BY m.data_invio DESC
+            LIMIT 5
+        """, (from_id, to_id, from_id, to_id))
+        messages = cursor.fetchall()
+        for message in messages:
+            message["data_invio"] = to_iso_utc(message.get("data_invio"))
+            message["autore_nome"] = clean_nome(
+                message.get("autore_nome"), message.get("autore_username")
+            )
+            message["reply_to_nome"] = clean_nome(
+                message.get("reply_to_nome"), message.get("reply_to_username")
+            )
+            message["avatar_from"] = to_download_url(message.pop("autore_foto", None))
+            message["avatar_to"] = to_download_url(message.pop("reply_to_foto", None))
+
+        reciprocity = round((2 * min(forward, reverse)) / total, 3) if total else 0
+        return jsonify({
+            "status": "success",
+            "from_user": users.get(from_id, {"id": from_id, "nome": str(from_id)}),
+            "to_user": users.get(to_id, {"id": to_id, "nome": str(to_id)}),
+            "stats": {
+                "forward": forward,
+                "reverse": reverse,
+                "total": total,
+                "reciprocal": forward > 0 and reverse > 0,
+                "reciprocity": reciprocity,
+            },
+            "messages": messages,
+        })
+    except Exception as exc:
+        logger.error("Errore dettaglio arco %s-%s: %s", from_id, to_id, exc, exc_info=True)
+        return jsonify({"status": "error", "message": "Errore interno"}), 500
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.route("/api/reply_summary/<int:user_id>", methods=["GET"])
+@cache.cached(timeout=120)
+def get_reply_summary(user_id: int):
+    """Riepilogo aggregato dei reply inviati e ricevuti, senza query N+1."""
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute("""
+            SELECT original.id_autore AS id,
+                   COALESCE(NULLIF(u.nome, ''), NULLIF(u.username, ''),
+                            CONCAT('Utente ', original.id_autore)) AS nome,
+                   COUNT(*) AS count
+            FROM messaggi reply
+            JOIN messaggi original
+              ON original.id_chat = reply.id_chat
+             AND original.id_messaggio = reply.reply_to_msg_id
+            LEFT JOIN utenti u ON u.id = original.id_autore
+            WHERE reply.id_autore = %s
+              AND original.id_autore > 0
+              AND original.id_autore <> reply.id_autore
+            GROUP BY original.id_autore, u.nome, u.username
+            ORDER BY count DESC
+        """, (user_id,))
+        sent = cursor.fetchall()
+
+        cursor.execute("""
+            SELECT reply.id_autore AS id,
+                   COALESCE(NULLIF(u.nome, ''), NULLIF(u.username, ''),
+                            CONCAT('Utente ', reply.id_autore)) AS nome,
+                   COUNT(*) AS count
+            FROM messaggi reply
+            JOIN messaggi original
+              ON original.id_chat = reply.id_chat
+             AND original.id_messaggio = reply.reply_to_msg_id
+            LEFT JOIN utenti u ON u.id = reply.id_autore
+            WHERE original.id_autore = %s
+              AND reply.id_autore > 0
+              AND reply.id_autore <> original.id_autore
+            GROUP BY reply.id_autore, u.nome, u.username
+            ORDER BY count DESC
+        """, (user_id,))
+        received = cursor.fetchall()
+
+        return jsonify({
+            "sent": sent,
+            "received": received,
+            "totalSent": sum(row["count"] for row in sent),
+            "totalReceived": sum(row["count"] for row in received),
+        })
+    except Exception as exc:
+        logger.error(f"Errore riepilogo reply per {user_id}: {exc}", exc_info=True)
+        return jsonify({"error": "Errore nel riepilogo reply"}), 500
+    finally:
+        cursor.close()
+        conn.close()
 
 
 # =========================
@@ -993,8 +1290,8 @@ def cerca_messaggi():
 
         # Conta (nota che serve la join con chat c per filtrare la categoria)
         count_query = f"""
-            SELECT COUNT(*) AS total 
-            FROM messaggi m 
+            SELECT COUNT(*) AS total
+            FROM messaggi m
             LEFT JOIN chat c ON m.id_chat = c.id_chat
             WHERE {where_clause}
         """
@@ -1066,39 +1363,39 @@ def ultimi_messaggi():
         limit = 50
 
         cursor.execute("""
-            SELECT 
-                m.id_messaggio, 
-                m.id_chat, 
+            SELECT
+                m.id_messaggio,
+                m.id_chat,
                 m.id_autore,
-                
+
                 -- Identifica tipo autore (stessa logica di /api/messaggi)
-                CASE 
+                CASE
                     WHEN m.id_autore = m.id_chat AND m.id_autore < 0 THEN 'channel_official'
                     WHEN m.id_autore < 0 THEN 'channel_external'
                     WHEN m.id_autore > 0 THEN 'user'
                     ELSE 'unknown'
                 END AS author_type,
-                
+
                 -- Dati utente
-                u.nome AS u_nome, 
-                u.username AS u_user, 
+                u.nome AS u_nome,
+                u.username AS u_user,
                 u.foto_path,
-                
+
                 -- Dati canale (se l'autore è un canale)
                 c_auth.nome_chat AS c_auth_nome,
                 c_auth.nome_chat_tradotto AS c_auth_nome_tradotto,
-                
+
                 -- Dati messaggio
-                m.testo, 
-                m.data_invio, 
+                m.testo,
+                m.data_invio,
                 m.tipo_evento,
-                m.file_path, 
+                m.file_path,
                 m.media_type,
-                
+
                 -- Provenienza
                 c.nome_chat AS provenienza,
                 c.nome_chat_tradotto AS provenienza_tradotta
-                
+
             FROM messaggi m
             LEFT JOIN utenti u ON m.id_autore = u.id
             LEFT JOIN chat c ON m.id_chat = c.id_chat
@@ -1110,7 +1407,7 @@ def ultimi_messaggi():
 
         for r in rows:
             author_type = r.get("author_type", "unknown")
-            
+
             # 🔹 GESTIONE NOME BASATA SUL TIPO DI AUTORE (stessa logica di /api/messaggi)
             if author_type == "channel_official":
                 # È il canale stesso che scrive (post ufficiale)
@@ -1127,7 +1424,7 @@ def ultimi_messaggi():
                 # È un utente normale
                 r["nome"] = clean_nome(r.get("u_nome"), r.get("u_user"))
                 r["is_channel_post"] = False
-            
+
             r["data_invio"] = to_iso_utc(r.get("data_invio"))
             r["file_url"] = to_download_url(r.get("file_path"))
             r["avatar_url"] = to_download_url(r.get("foto_path"))
@@ -1202,14 +1499,22 @@ def traduci():
     try:
         data = request.get_json(force=True)
         q = data.get("q", "").strip()
+        source_language = data.get("source", "und").strip().lower()
         if not q:
             return jsonify({"error": "Parametro 'q' mancante"}), 400
+        if len(q) > 5000:
+            return jsonify({"error": "Testo troppo lungo (massimo 5000 caratteri)"}), 400
 
-        tradotto = translate_if_needed(q)
+        tradotto = translate_if_needed(q, source_language)
         return jsonify({"translatedText": tradotto})
+    except TooManyRequests:
+        logger.warning("Limite temporaneo del servizio di traduzione raggiunto")
+        return jsonify({
+            "error": "Servizio di traduzione temporaneamente limitato. Riprova tra un minuto."
+        }), 429
     except Exception as e:
         logger.error(f"Errore traduzione: {e}", exc_info=True)
-        return jsonify({"error": "Errore traduzione"}), 500
+        return jsonify({"error": "Traduzione non disponibile. Riprova più tardi."}), 502
 
 
 # =========================
@@ -1504,30 +1809,44 @@ def suggerisci_chat_per_utente():
             conn.close()
         except:
             pass
-        
+
 
 @app.route("/api/graph", methods=["GET"])
 def api_graph():
     limit = int(request.args.get("limit", 50))
     category = request.args.get("category")
+    include_communities = request.args.get("communities", "0").lower() in ("1", "true", "yes")
 
     if category:
         q = """
         MATCH (u:Utente)-[r:REPLIED_TO]-(v:Utente)
         WHERE r.category = $category
           AND u.id IS NOT NULL AND v.id IS NOT NULL AND u.id <> v.id
-        WITH u, count(r) AS deg
+        WITH u, sum(r.count) AS deg
         ORDER BY deg DESC
         LIMIT 10
+        WITH collect(u.id) AS topIds
 
-        MATCH (u)-[r:REPLIED_TO]-(v:Utente)
-        WHERE r.category = $category AND u.id < v.id
-        WITH u, v, sum(r.count) AS peso
+        MATCH (source:Utente)-[r:REPLIED_TO]->(target:Utente)
+        WHERE (source.id IN topIds OR target.id IN topIds)
+          AND r.category = $category
+          AND source.id IS NOT NULL AND target.id IS NOT NULL
+          AND source.id <> target.id
+        WITH source, target, r,
+             CASE WHEN source.id < target.id THEN source.id ELSE target.id END AS fromId,
+             CASE WHEN source.id < target.id THEN target.id ELSE source.id END AS toId
+        WITH fromId, toId,
+             sum(r.count) AS peso,
+             sum(CASE WHEN source.id < target.id THEN r.count ELSE 0 END) AS forward,
+             sum(CASE WHEN source.id > target.id THEN r.count ELSE 0 END) AS reverse
         ORDER BY peso DESC
         LIMIT $limit
 
-        WITH collect({from: u.id, to: v.id, peso: peso}) AS rels,
-             collect(DISTINCT u) + collect(DISTINCT v) AS utenti
+        MATCH (fromNode:Utente {id: fromId})
+        MATCH (toNode:Utente {id: toId})
+        WITH collect({from: fromId, to: toId, peso: peso,
+                      forward: forward, reverse: reverse}) AS rels,
+             collect(DISTINCT fromNode) + collect(DISTINCT toNode) AS utenti
         RETURN rels, utenti
         """
         params = {"limit": limit, "category": category}
@@ -1535,18 +1854,30 @@ def api_graph():
         q = """
         MATCH (u:Utente)-[r:REPLIED_TO_GLOBAL]-(v:Utente)
         WHERE u.id IS NOT NULL AND v.id IS NOT NULL AND u.id <> v.id
-        WITH u, count(r) AS deg
+        WITH u, sum(r.count) AS deg
         ORDER BY deg DESC
         LIMIT 10
+        WITH collect(u.id) AS topIds
 
-        MATCH (u)-[r:REPLIED_TO_GLOBAL]-(v:Utente)
-        WHERE u.id < v.id
-        WITH u, v, sum(r.count) AS peso
+        MATCH (source:Utente)-[r:REPLIED_TO_GLOBAL]->(target:Utente)
+        WHERE (source.id IN topIds OR target.id IN topIds)
+          AND source.id IS NOT NULL AND target.id IS NOT NULL
+          AND source.id <> target.id
+        WITH source, target, r,
+             CASE WHEN source.id < target.id THEN source.id ELSE target.id END AS fromId,
+             CASE WHEN source.id < target.id THEN target.id ELSE source.id END AS toId
+        WITH fromId, toId,
+             sum(r.count) AS peso,
+             sum(CASE WHEN source.id < target.id THEN r.count ELSE 0 END) AS forward,
+             sum(CASE WHEN source.id > target.id THEN r.count ELSE 0 END) AS reverse
         ORDER BY peso DESC
         LIMIT $limit
 
-        WITH collect({from: u.id, to: v.id, peso: peso}) AS rels,
-             collect(DISTINCT u) + collect(DISTINCT v) AS utenti
+        MATCH (fromNode:Utente {id: fromId})
+        MATCH (toNode:Utente {id: toId})
+        WITH collect({from: fromId, to: toId, peso: peso,
+                      forward: forward, reverse: reverse}) AS rels,
+             collect(DISTINCT fromNode) + collect(DISTINCT toNode) AS utenti
         RETURN rels, utenti
         """
         params = {"limit": limit}
@@ -1562,13 +1893,16 @@ def api_graph():
                     {r["to"] for r in rels if r.get("to")}
 
     nodes = []
+    seen_node_ids = set()
     for u in utenti:
-        if not u.get("id") or u["id"] not in connected_ids:
+        uid = u.get("id")
+        if not uid or uid not in connected_ids or uid in seen_node_ids:
             continue
+        seen_node_ids.add(uid)
 
         nodes.append({
-            "id": f"user_{u['id']}",
-            "label": u.get("username") or str(u["id"]),
+            "id": f"user_{uid}",
+            "label": u.get("username") or str(uid),
             "group": "Utente",
             "shape": "dot"
         })
@@ -1588,10 +1922,59 @@ def api_graph():
             "from": f"user_{r['from']}",
             "to": f"user_{r['to']}",
             "label": str(r["peso"]),
-            "value": r["peso"]
+            "value": r["peso"],
+            "forward": int(r.get("forward") or 0),
+            "reverse": int(r.get("reverse") or 0),
+            "reciprocal": bool(r.get("forward") and r.get("reverse")),
+            "reciprocity": round(
+                (2 * min(r.get("forward") or 0, r.get("reverse") or 0)) / r["peso"],
+                3,
+            ) if r.get("peso") else 0,
         })
 
-    return jsonify({"nodes": nodes, "edges": edges})
+    payload = {"nodes": nodes, "edges": edges}
+    if include_communities and not category:
+        analysis = get_community_analysis(run_query)
+        metrics_by_node = analysis["node_metrics"]
+        labeled_communities = enrich_community_labels(analysis["communities"])
+        labels_by_id = {
+            community["id"]: community["label"]
+            for community in labeled_communities
+        }
+        for node in nodes:
+            user_id = int(node["id"].replace("user_", ""))
+            metrics = metrics_by_node.get(user_id)
+            if not metrics:
+                continue
+            node.update({
+                "community": metrics["community"],
+                "community_label": labels_by_id.get(metrics["community"]),
+                "pagerank": metrics["pagerank"],
+                "bridge_score": metrics["bridge_score"],
+                "external_communities": metrics["external_communities"],
+                "weighted_degree": metrics["weighted_degree"],
+            })
+        payload["community_analysis"] = {
+            "summary": analysis["summary"],
+            "communities": labeled_communities[:20],
+            "bridges": analysis["bridges"][:20],
+        }
+
+    return jsonify(payload)
+
+
+@app.route("/api/graph/community-analysis", methods=["GET"])
+@cache.cached(timeout=300)
+def api_graph_community_analysis():
+    analysis = get_community_analysis(
+        run_query,
+        force=request.args.get("refresh", "0") in ("1", "true"),
+    )
+    return jsonify({
+        "summary": analysis["summary"],
+        "communities": enrich_community_labels(analysis["communities"]),
+        "bridges": analysis["bridges"],
+    })
 
 
 # ===========================================================
@@ -1683,16 +2066,18 @@ def api_graph_focus():
         WITH uid1, uid2
         WHERE uid1 < uid2
 
-        OPTIONAL MATCH (u1:Utente {id: uid1})-[r1:REPLIED_TO_GLOBAL]->(u2:Utente {id: uid2})
-        OPTIONAL MATCH (u2b:Utente {id: uid2})-[r2:REPLIED_TO_GLOBAL]->(u1b:Utente {id: uid1})
+        OPTIONAL MATCH (u1:Utente {id: uid1})-[r1:REPLIED_TO {chatId: $chatId}]->(u2:Utente {id: uid2})
+        OPTIONAL MATCH (u2b:Utente {id: uid2})-[r2:REPLIED_TO {chatId: $chatId}]->(u1b:Utente {id: uid1})
 
         WITH uid1 AS da, uid2 AS a,
+             coalesce(r1.count, 0) AS forward,
+             coalesce(r2.count, 0) AS reverse,
              coalesce(r1.count, 0) + coalesce(r2.count, 0) AS peso
         WHERE peso > 0
-        RETURN da, a, peso
+        RETURN da, a, peso, forward, reverse
         """
 
-        res_edges = run_query(q_edges, {"ids": user_ids}) or []
+        res_edges = run_query(q_edges, {"ids": user_ids, "chatId": fid}) or []
 
         edges = [
             {
@@ -1700,7 +2085,14 @@ def api_graph_focus():
                 "from": f"user_{r['da']}",
                 "to": f"user_{r['a']}",
                 "label": str(r["peso"]),
-                "value": r["peso"]
+                "value": r["peso"],
+                "forward": int(r.get("forward") or 0),
+                "reverse": int(r.get("reverse") or 0),
+                "reciprocal": bool(r.get("forward") and r.get("reverse")),
+                "reciprocity": round(
+                    (2 * min(r.get("forward") or 0, r.get("reverse") or 0)) / r["peso"],
+                    3,
+                ) if r.get("peso") else 0,
             }
             for r in res_edges
         ]
@@ -1721,9 +2113,9 @@ def api_graph_focus():
 
     if category:
         rel_type = "REPLIED_TO"
-        node_filter = "WHERE r.category = $category"
-        edge_filter1 = "WHERE r1.category = $category"
-        edge_filter2 = "WHERE r2.category = $category"
+        node_filter = "AND r.category = $category"
+        edge_filter1 = "WHERE r1 IS NULL OR r1.category = $category"
+        edge_filter2 = "WHERE r2 IS NULL OR r2.category = $category"
         params["category"] = category
     else:
         rel_type = "REPLIED_TO_GLOBAL"
@@ -1734,8 +2126,8 @@ def api_graph_focus():
     # 1️⃣ Trovo vicini top
     q = f"""
     MATCH (u:Utente {{id:$focusId}})-[r:{rel_type}]-(v:Utente)
-    {node_filter}
     WHERE v.id IS NOT NULL AND u.id <> v.id
+    {node_filter}
     WITH v, sum(r.count) AS totReply
     ORDER BY totReply DESC
     LIMIT $top
@@ -1756,19 +2148,22 @@ def api_graph_focus():
 
     OPTIONAL MATCH (u:Utente {{id:$focusId}})-[r1:{rel_type}]->(v:Utente {{id: vid}})
     {edge_filter1}
+    WITH vid, coalesce(sum(r1.count), 0) AS focusTo
 
     OPTIONAL MATCH (v2:Utente {{id: vid}})-[r2:{rel_type}]->(u2:Utente {{id:$focusId}})
     {edge_filter2}
 
-    WITH vid,
-         coalesce(r1.count, 0) + coalesce(r2.count, 0) AS peso
+    WITH vid, focusTo, coalesce(sum(r2.count), 0) AS toFocus
+    WITH vid, focusTo, toFocus, focusTo + toFocus AS peso
     WHERE peso > 0
 
-    WITH 
+    WITH
         CASE WHEN $focusId < vid THEN $focusId ELSE vid END AS da,
         CASE WHEN $focusId < vid THEN vid ELSE $focusId END AS a,
-        peso
-    RETURN DISTINCT da, a, peso
+        peso,
+        CASE WHEN $focusId < vid THEN focusTo ELSE toFocus END AS forward,
+        CASE WHEN $focusId < vid THEN toFocus ELSE focusTo END AS reverse
+    RETURN DISTINCT da, a, peso, forward, reverse
     """
 
     res_edges = run_query(q_edges, params) or []
@@ -1813,7 +2208,14 @@ def api_graph_focus():
             "from": f"user_{da}",
             "to": f"user_{a}",
             "label": str(peso),
-            "value": peso
+            "value": peso,
+            "forward": int(r.get("forward") or 0),
+            "reverse": int(r.get("reverse") or 0),
+            "reciprocal": bool(r.get("forward") and r.get("reverse")),
+            "reciprocity": round(
+                (2 * min(r.get("forward") or 0, r.get("reverse") or 0)) / peso,
+                3,
+            ) if peso else 0,
         })
 
     return jsonify({
@@ -1823,7 +2225,7 @@ def api_graph_focus():
     })
 
 # =========================
-# Top utenti 
+# Top utenti
 # =========================
 @app.route("/api/top_utenti", methods=["GET"])
 @cache.cached(timeout=60, key_prefix="top_utenti")
@@ -1832,10 +2234,10 @@ def get_top_utenti():
     try:
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
-        
+
         # Query: Estrazione dell'ID corto corretto (senza -100) per la JOIN
         cursor.execute("""
-            SELECT 
+            SELECT
                 m.id_autore,
                 COUNT(m.id_messaggio) AS messaggi,
                 u.nome AS u_nome,
@@ -1844,23 +2246,23 @@ def get_top_utenti():
                 c_auth.nome_chat_tradotto AS c_nome_tradotto_auth
             FROM messaggi m
             LEFT JOIN utenti u ON u.id = m.id_autore
-            
+
             -- ⚠️ NUOVA LOGICA DI JOIN:
             -- Se id_autore è negativo (-100xxxx), prendiamo ABS(SUBSTRING(id_autore, 2)) che diventa xxxx.
             -- Se id_autore è positivo, usiamo semplicemente l'id_autore.
-            LEFT JOIN chat c_auth ON c_auth.id_chat = 
-                CASE 
+            LEFT JOIN chat c_auth ON c_auth.id_chat =
+                CASE
                     WHEN m.id_autore < 0 THEN ABS(CAST(SUBSTRING(CAST(m.id_autore AS CHAR), 5) AS SIGNED))
                     ELSE m.id_autore
                 END
-                
+
             WHERE m.id_autore IS NOT NULL
             -- La GROUP BY DEVE includere tutti i campi non aggregati
             GROUP BY m.id_autore, u.nome, u.username, c_auth.nome_chat, c_auth.nome_chat_tradotto
             ORDER BY messaggi DESC
             LIMIT %s
         """, (limit,))
-        
+
         rows = cursor.fetchall()
 
         # Post-processing per costruire il nome (non è cambiato)
@@ -1869,7 +2271,7 @@ def get_top_utenti():
             id_autore = r["id_autore"]
             nome_chat = r.get("c_nome_auth")
             nome_chat_tradotto = r.get("c_nome_tradotto_auth")
-            
+
             # 🔹 Logica nome:
             if r["u_nome"] or r["u_user"]:
                 # 1. Utente
@@ -1884,7 +2286,7 @@ def get_top_utenti():
                 # 3. Fallback (Nome chat non trovato)
                 nome = f"Canale Esterno {abs(id_autore)}" if id_autore < 0 else f"Utente Sconosciuto {id_autore}"
                 is_channel = id_autore < 0
-            
+
             data.append({
                 "id": id_autore,
                 "nome": nome,
@@ -1892,7 +2294,7 @@ def get_top_utenti():
                 "messaggi": r["messaggi"],
                 "is_channel": is_channel
             })
-        
+
         return jsonify({"status": "success", "data": data})
     except Exception as e:
         logger.error(f"Errore DB in get_top_utenti: {e}", exc_info=True)
@@ -1926,7 +2328,7 @@ def get_top_chat():
             LIMIT %s
         """, (limit,))
         rows = cursor.fetchall()
-        
+
         # Aggiungi flag is_channel
         for r in rows:
             r["is_channel"] = r["id_chat"] < 0
@@ -2009,9 +2411,9 @@ def api_graph_keyword():
         params_mysql.extend([min_count, max_users])
 
         cursor.execute(f"""
-            SELECT m.id_autore, 
+            SELECT m.id_autore,
                    COUNT(*) AS kw_count,
-                   SUM(LENGTH(m.testo) - LENGTH(REPLACE(LOWER(m.testo), %s, ''))) 
+                   SUM(LENGTH(m.testo) - LENGTH(REPLACE(LOWER(m.testo), %s, '')))
                    / LENGTH(%s) AS kw_frequency
             FROM messaggi m
             {cat_join}
@@ -2044,24 +2446,24 @@ def api_graph_keyword():
             params_rel.append(category)
 
         cursor.execute(f"""
-            SELECT 
+            SELECT
                 LEAST(m.id_autore, m2.id_autore) AS da,
                 GREATEST(m.id_autore, m2.id_autore) AS a,
                 COUNT(*) AS kw_count_rel,
                 SUM(CASE WHEN MATCH(m.testo) AGAINST(%s IN BOOLEAN MODE) THEN 1 ELSE 0 END) AS kw_in_reply,
                 SUM(CASE WHEN MATCH(m2.testo) AGAINST(%s IN BOOLEAN MODE) THEN 1 ELSE 0 END) AS kw_in_original
             FROM messaggi m
-            JOIN messaggi m2 
-              ON m.reply_to_msg_id = m2.id_messaggio 
+            JOIN messaggi m2
+              ON m.reply_to_msg_id = m2.id_messaggio
              AND m.id_chat = m2.id_chat
             {cat_join}
-            WHERE m.id_autore IS NOT NULL 
+            WHERE m.id_autore IS NOT NULL
               AND m.id_autore > 0
               AND m2.id_autore IS NOT NULL
               AND m2.id_autore > 0
               AND m.id_autore <> m2.id_autore
               AND (
-                  m.id_autore IN ({placeholders}) 
+                  m.id_autore IN ({placeholders})
                   OR m2.id_autore IN ({placeholders})
               )
               AND (
@@ -2082,8 +2484,8 @@ def api_graph_keyword():
             target_count_map[r["a"]] = target_count_map.get(r["a"], 0) + r["kw_count_rel"]
 
         top_targets = sorted(
-            target_count_map, 
-            key=target_count_map.get, 
+            target_count_map,
+            key=target_count_map.get,
             reverse=True
         )[:max_targets]
 
@@ -2142,7 +2544,7 @@ def api_graph_keyword():
         OPTIONAL MATCH (u2b:Utente {{id: uid2}})-[r2:{rel_type}]->(u1b:Utente {{id: uid1}})
         {where_edge2}
 
-        WITH uid1 AS da, uid2 AS a, 
+        WITH uid1 AS da, uid2 AS a,
              coalesce(r1.count, 0) + coalesce(r2.count, 0) AS peso
         WHERE peso > 0
         RETURN da, a, peso
@@ -2291,7 +2693,7 @@ def api_import_status(target):
     key = str(target)
     # Se lo stato non è presente, assumiamo che sia terminato (IDLE)
     status = IMPORT_STATUS.get(key, {"status": "idle", "progress": "ℹ️ Scansione completata (non più in memoria)."})
-    
+
     # ⚠️ FIX: Se Flask restituisce 404, il frontend entra in errore.
     # Restituire sempre 200 OK, anche se lo stato è IDLE.
     return jsonify(status)
@@ -2311,7 +2713,7 @@ def api_telegram_status():
             "authenticated": False,
             "message": f"Errore: {str(e)}"
         }), 500
-    
+
 
 # =========================
 # OSINT - Maigret Integration
@@ -2328,16 +2730,16 @@ def get_osint_report(username):
         reports_dir = Path(OSINT_REPORTS_DIR)
         if not reports_dir.exists():
             return jsonify({"status": "not_found", "message": "Nessun report disponibile"}), 404
-        
+
         # Cerca file che contiene l'username
         report_file = None
         for f in reports_dir.glob(f"*{username}*.html"):
             report_file = f
             break
-        
+
         if not report_file or not report_file.exists():
             return jsonify({"status": "not_found", "message": "Report non trovato"}), 404
-        
+
         # Ritorna info sul file
         return jsonify({
             "status": "success",
@@ -2346,7 +2748,7 @@ def get_osint_report(username):
             "report_url": f"/api/osint/{username}/report/view",
             "created_at": datetime.fromtimestamp(report_file.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
         })
-        
+
     except Exception as e:
         logger.error(f"Errore recupero report OSINT: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -2357,18 +2759,18 @@ def view_osint_report(username):
     """Serve il file HTML del report"""
     try:
         reports_dir = Path(OSINT_REPORTS_DIR)
-        
+
         # Cerca il file
         report_file = None
         for f in reports_dir.glob(f"*{username}*.html"):
             report_file = f
             break
-        
+
         if not report_file or not report_file.exists():
             return "Report non trovato", 404
-        
+
         return send_from_directory(str(reports_dir), report_file.name, mimetype='text/html')
-        
+
     except Exception as e:
         logger.error(f"Errore view report: {e}")
         return f"Errore: {str(e)}", 500
@@ -2379,21 +2781,21 @@ def search_osint(username):
     """Avvia una ricerca OSINT per un username"""
     try:
         from maigret_service import queue_maigret_request, get_request_status
-        
+
         current_status = get_request_status(username)
         if current_status.get("status") in ["queued", "processing"]:
             return jsonify({
                 "status": current_status["status"],
                 "message": current_status["message"]
             })
-        
+
         queue_maigret_request(username)
-        
+
         return jsonify({
             "status": "queued",
             "message": "⏳ Ricerca OSINT avviata. Attendere 1-2 minuti..."
         })
-        
+
     except ImportError:
         return jsonify({"status": "error", "message": "❌ Servizio Maigret non configurato"}), 501
     except Exception as e:
@@ -2412,7 +2814,7 @@ def get_osint_status(username):
         return jsonify({"status": "idle", "message": "Servizio non attivo"})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
-    
+
 # =========================
 # SangMata - Storico Username
 # =========================
@@ -2440,16 +2842,16 @@ def get_utente_storico(user_id):
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
         cursor.execute("""
-            SELECT username, first_name, last_name, rilevato_il, fonte 
-            FROM storico_username 
-            WHERE user_id = %s 
+            SELECT username, first_name, last_name, rilevato_il, fonte
+            FROM storico_username
+            WHERE user_id = %s
             ORDER BY rilevato_il DESC
         """, (user_id,))
         rows = cursor.fetchall()
-        
+
         for r in rows:
             r["rilevato_il"] = to_iso_utc(r["rilevato_il"])
-            
+
         return jsonify({"status": "success", "data": rows})
     except Exception as e:
         logger.error(f"Errore recupero storico DB: {e}")
@@ -2457,9 +2859,9 @@ def get_utente_storico(user_id):
     finally:
         cursor.close()
         conn.close()
-        
-    
-    
+
+
+
 # =========================
 # Main
 # =========================

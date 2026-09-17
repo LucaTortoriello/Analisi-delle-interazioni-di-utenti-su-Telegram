@@ -2,7 +2,13 @@
   <div class="dashboard">
     <!-- Header --> 
     <div class="dashboard-header">
-      <h1 class="page-title">Dashboard</h1>
+      <header class="app-page-header">
+        <div>
+          <span class="app-eyebrow">Analysis overview</span>
+          <h1 class="page-title">Dashboard</h1>
+          <p class="app-page-description">Una vista sintetica su utenti, conversazioni e attività raccolte.</p>
+        </div>
+      </header>
       <div class="kpis">
         <!-- KPI -->
         <router-link to="/utenti" class="kpi-card">
@@ -244,64 +250,64 @@ export default {
 
 <style scoped>
 .dashboard { 
-  padding: 1rem 2rem; 
+  padding: 2rem clamp(0.25rem, 1.5vw, 1.75rem) 3rem; 
   width: 100%; 
-  max-width: 100%; 
+  max-width: 1800px;
+  margin: 0 auto;
 }
 
 .dashboard-header { 
   display: flex; 
   flex-direction: column; 
-  gap: 1rem; 
-  margin-bottom: 2rem; 
-}
-.page-title { 
-  font-size: 1.8rem; 
-  font-weight: 700; 
-  color: var(--color-primary); 
+  gap: 0;
+  margin-bottom: 1rem;
 }
 
 .kpis { 
   display: flex; 
-  gap: 1.5rem; 
-  flex-wrap: wrap; 
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.75rem;
 }
 .kpi-card {
-  flex: 1; 
-  min-width: 220px;
   display: flex; 
   align-items: center; 
-  gap: 1rem;
-  background: linear-gradient(135deg, #ffffff, var(--color-accent));
-  border-radius: 16px; 
-  padding: 1.25rem 1.75rem;
+  gap: 0.85rem;
+  min-height: 82px;
+  padding: 0.9rem 1rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 13px;
+  background: #fff;
   text-decoration: none; 
   color: inherit;
-  box-shadow: var(--shadow-soft); 
-  transition: all 0.25s ease;
+  box-shadow: 0 1px 2px rgba(15,23,42,0.03);
+  transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
 }
 .kpi-card:hover { 
-  transform: translateY(-4px); 
-  box-shadow: var(--shadow-strong); 
+  transform: translateY(-2px);
+  border-color: #c7d2fe;
+  box-shadow: 0 8px 20px rgba(15,23,42,0.07);
 }
 .kpi-icon { 
-  width: 50px; 
-  height: 50px; 
-  border-radius: 14px; 
-  background: rgba(30,79,209,0.08); 
+  width: 38px; 
+  height: 38px; 
+  border-radius: 10px; 
+  background: #eef2ff;
   display: flex; 
   align-items: center; 
   justify-content: center; 
-  color: var(--color-primary); 
+  color: #4f46e5;
 }
+.kpi-icon .icon { width: 21px; height: 21px; }
 .kpi-title { 
   font-size: 0.8rem; 
   font-weight: 600; 
   text-transform: uppercase; 
-  color: var(--color-muted); 
+  color: #64748b;
+  letter-spacing: 0.03em;
 }
 .kpi-value { 
-  font-size: 1.5rem; 
+  font-size: 1.35rem;
   font-weight: 700; 
   color: var(--color-primary); 
 }
@@ -310,7 +316,7 @@ export default {
 .main-layout {
   display: grid;
   grid-template-columns: 280px 1fr; /* sidebar + contenuto */
-  gap: 2rem;
+  gap: 1rem;
   width: 100%;
   max-width: 100%;
 }
@@ -328,9 +334,10 @@ export default {
 /* Card */
 .card {
   background: #fff;
-  border-radius: 18px;
+  border: 1px solid #e2e8f0;
+  border-radius: 16px;
   padding: 1.25rem 1.5rem;
-  box-shadow: var(--shadow-soft);
+  box-shadow: 0 4px 18px rgba(15,23,42,0.045);
 }
 .card h3 { 
   margin-bottom: 1rem; 
@@ -348,7 +355,7 @@ export default {
   display: flex; 
   justify-content: space-between; 
   padding: 0.6rem 0; 
-  border-bottom: 1px solid #eee; 
+  border-bottom: 1px solid #edf1f6;
   color: #1e293b; 
   text-decoration: none; 
 }
@@ -356,7 +363,14 @@ export default {
   color: var(--color-primary); 
 }
 .cat-count { 
-  font-weight: bold; 
+  min-width: 28px;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  background: #eef2ff;
+  color: #4f46e5;
+  font-size: 0.75rem;
+  font-weight: 800;
+  text-align: center;
 }
 
 /* Grafico grande */
@@ -374,5 +388,9 @@ canvas {
     grid-template-columns: 1fr;
   }
   .sidebar { order: 2; }
+}
+@media (max-width: 768px) {
+  .dashboard { padding: 1rem 0 2rem; }
+  .kpis { grid-template-columns: 1fr; }
 }
 </style>

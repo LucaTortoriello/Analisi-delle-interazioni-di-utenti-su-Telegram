@@ -1,17 +1,20 @@
 <template>
-  <div v-cloak>
-    <h1 class="page-title">
-      Messaggi
-      <span v-if="chatId && (chatInfo.nome_chat_tradotto || chatInfo.nome_chat)">
-        — {{ chatInfo.nome_chat_tradotto || chatInfo.nome_chat }}
-      </span>
-    </h1>
-
-    <div class="toolbar">
+  <div v-cloak class="app-section messages-page">
+    <header class="app-page-header messages-header">
+      <div>
+        <span class="app-eyebrow">Content intelligence</span>
+        <h1 class="page-title">
+          Messaggi
+          <span v-if="chatId && (chatInfo.nome_chat_tradotto || chatInfo.nome_chat)">
+            — {{ chatInfo.nome_chat_tradotto || chatInfo.nome_chat }}
+          </span>
+        </h1>
+        <p class="app-page-description">Esplora contenuti, autori, intervalli temporali e collegamenti tra conversazioni.</p>
+      </div>
       <button class="btn-back" @click="tornaAllaVistaIniziale">
         <span class="icon">⟵</span> Vista iniziale
       </button>
-    </div>
+    </header>
 
     <div v-if="chatId && chatInfo.id_chat" class="card chat-info">
       <div class="chat-info-header">
@@ -322,6 +325,7 @@
         </button>
 
         <span v-if="m.translating" class="muted">Traduzione in corso...</span>
+        <p v-if="m.translation_error" class="translation-error">{{ m.translation_error }}</p>
         <p v-if="m.testo_tradotto" class="tradotto">🇮🇹 {{ m.testo_tradotto }}</p>
       </div>
 
@@ -787,15 +791,18 @@ export default {
     async traduci(m) {
       try {
         m.translating = true;
+        m.translation_error = "";
         const res = await fetch(`${this.apiBase()}/api/traduci`, {
           method: "POST",
-          body: JSON.stringify({ q: m.testo }),
+          body: JSON.stringify({ q: m.testo, source: m.lang || franc(m.testo || "") }),
           headers: { "Content-Type": "application/json" },
         });
         const json = await res.json();
+        if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
         if (json.translatedText) m.testo_tradotto = json.translatedText;
       } catch (e) {
         console.error("Errore traduzione:", e);
+        m.translation_error = e.message || "Traduzione non disponibile";
       } finally {
         m.translating = false;
       }
@@ -965,6 +972,26 @@ export default {
   display: none; 
 }
 
+.messages-header .page-title {
+  margin: 0 0 0.35rem;
+  color: #0f172a;
+  font-size: clamp(2rem, 3vw, 2.65rem);
+  line-height: 1.08;
+  letter-spacing: -0.04em;
+}
+
+.messages-header .btn-back { flex: 0 0 auto; margin-top: 0.35rem; }
+
+.user-activity-banner {
+  margin-bottom: 1rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 13px;
+  box-shadow: 0 1px 2px rgba(15,23,42,0.03);
+}
+
+.user-activity-banner strong { color: #334155; font-size: 0.88rem; }
+
 /* --- FILTRI E INPUT --- */
 .filters {
   display: flex;
@@ -1077,11 +1104,11 @@ input.input.small {
 
 .search-bar {
   background: #fff;
-  border-radius: 16px;
-  padding: 1.2rem 1.5rem;
-  margin-bottom: 1.5rem;
-  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
-  border: 1px solid #f1f5f9;
+  border-radius: 15px;
+  padding: 0.9rem;
+  margin-bottom: 1rem;
+  box-shadow: 0 4px 18px rgba(15,23,42,0.045);
+  border: 1px solid #dfe6ef;
 }
 
 @media (max-width: 1024px) {
@@ -1288,18 +1315,18 @@ input.input.small {
   gap: .6rem; 
   padding: 1.1rem 1.3rem; 
   border: 1px solid #e5eaf0; 
-  border-radius: 14px; 
+  border-radius: 15px;
   background: #fff; 
   transition: all .25s ease; 
   margin-bottom: .9rem; 
-  box-shadow: 0 2px 6px rgba(0,0,0,0.03);
+  box-shadow: 0 3px 12px rgba(15,23,42,0.04);
 }
 
 .msg:hover {
   background: #f9fbff; 
   border-color: #cbd5e1; 
-  transform: translateY(-2px);
-  box-shadow: 0 4px 12px rgba(0,0,0,0.06);
+  transform: translateY(-1px);
+  box-shadow: 0 8px 20px rgba(15,23,42,0.065);
 }
 
 /* 📢 Messaggi del canale ufficiale */

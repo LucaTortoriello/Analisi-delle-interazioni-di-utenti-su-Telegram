@@ -1,9 +1,12 @@
 # Librerie Flask per API
 flask
 flask-cors
+Flask-Caching
 
 # Connessione a MySQL
 mysql-connector-python
+neo4j
+networkx>=3.4,<4
 
 # Gestione variabili d'ambiente
 python-dotenv
@@ -16,3 +19,4 @@ telethon
 
 # Utility varie
 requests
+qrcode
