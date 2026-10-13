@@ -71,7 +71,8 @@ def translate_if_needed(text: str, source_language: str = "und") -> str:
 # Configurazione base
 # =========================
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173"]}})
+frontend_origin = os.getenv("FRONTEND_ORIGIN", "*")
+CORS(app, resources={r"/api/*": {"origins": frontend_origin}})
 
 # =========================
 # Cache temporanea (RAM)
@@ -2866,4 +2867,8 @@ def get_utente_storico(user_id):
 # Main
 # =========================
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    app.run(
+        host=os.getenv("API_HOST", "0.0.0.0"),
+        port=int(os.getenv("API_PORT", "5000")),
+        debug=os.getenv("FLASK_DEBUG", "false").lower() == "true",
+    )

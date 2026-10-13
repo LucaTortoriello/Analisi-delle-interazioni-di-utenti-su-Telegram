@@ -1,0 +1,14 @@
+node_modules
+dist
+venv
+__pycache__
+*.pyc
+*.session
+*.session-journal
+credenzialiDB.env
+.env
+.git
+.DS_Store
+downloads
+osint_reports
+*.log
